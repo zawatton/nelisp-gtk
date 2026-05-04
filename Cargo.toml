@@ -1,0 +1,17 @@
+[package]
+name = "nelisp-emacs-gtk"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+description = "GTK4 GUI display backend for nelisp-emacs (Layer 3, Doc 51 Phase 11.C target)"
+
+[[bin]]
+name = "nemacs-gtk"
+path = "src/main.rs"
+
+[dependencies]
+gtk = { package = "gtk4", version = "0.9" }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
