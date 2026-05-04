@@ -1,15 +1,22 @@
-// Phase 1.D.2 — interactive buffer editing.
+// Phase 1.D.3b — command-loop-routed key dispatch.
 //
-// 1.D.1 captured GTK key events but only echoed them in a status row;
-// the welcome-buffer area stayed static.  This phase wires those events
-// into the embedded NeLisp Session so each keystroke mutates the live
-// `*welcome*' buffer (= self-insert / Backspace / Enter / Left / Right)
-// and the resulting `(buffer-string)` is re-queried + re-stamped into
-// the grid before `queue_draw` repaints.
+// 1.D.2 translated each GTK key into a hard-coded edit primitive
+// (`(insert ...)' / `(delete-backward-char 1)' / `(backward-char 1)' /
+// `(forward-char 1)' / `(newline)').  That bypassed the full Layer 2
+// dispatch path (= keymap lookup → `command-execute' → `call-
+// interactively' → command bookkeeping), which means binding overrides,
+// `pre-command-hook', `post-command-hook', `this-command' /
+// `last-command' state, and `self-insert-command' / `newline' /
+// `delete-backward-char' undo recording all stayed dark.
 //
-// We bypass the full `emacs-command-loop' dispatcher this round and
-// translate keys directly to the corresponding edit primitive.  Phase
-// 1.D.3 will route through the command loop + show a visible cursor.
+// This phase wires the GTK key event into
+// `emacs-command-loop-feed-events' + `emacs-command-loop-step', which
+// is the same dispatch entrypoint the TUI driver uses.  At boot time
+// we install a minimal global keymap (printable ASCII →
+// `self-insert-command'; RET → `newline'; Backspace →
+// `delete-backward-char'; arrows → motion).  GTK keysyms translate to
+// either an integer (= the unicode codepoint, for `self-insert')
+// or a quoted symbol like `'backspace' / `'left' / `'return'.
 
 mod grid;
 mod nelisp_bridge;
@@ -93,10 +100,10 @@ fn welcome_buffer_form() -> &'static str {
             (erase-buffer)
             (insert "Welcome to nemacs-gtk!\n")
             (insert "\n")
-            (insert "Phase 1.D.2: type printable keys to insert text,\n")
-            (insert "press Backspace to delete, Enter for newline,\n")
-            (insert "Left/Right to move point.  Edits round-trip\n")
-            (insert "through the embedded NeLisp Session.\n")
+            (insert "Phase 1.D.3b: keys route through the substrate\n")
+            (insert "command-loop now (= self-insert / newline /\n")
+            (insert "delete-backward-char / motion via call-interactively).\n")
+            (insert "Try typing, Backspace, Enter, Left/Right.\n")
             (insert "\n")
             (insert "> "))
           (buffer-name buf)))"#
@@ -198,37 +205,33 @@ fn refresh_buffer_area(grid: &mut CharGrid, session: &mut Session) -> Option<(us
     }
 }
 
-/// Translate a GTK key event into an elisp form that mutates the
-/// `*welcome*' buffer.  Returns an empty string when the key has no
-/// handled binding (= the caller skips the eval).
-fn build_dispatch_form(keyval: gdk::Key, _modifier: gdk::ModifierType) -> String {
+/// Translate a GTK key event into the elisp event literal the
+/// command-loop expects in the unread queue:
+///
+/// - integer literal "65" — printable ASCII, dispatched to `self-
+///   insert-command' through the global keymap;
+/// - quoted symbol "'backspace" — function keys / motion arrows,
+///   matched against `(define-key m (vector 'backspace) ...)' bindings.
+///
+/// Returns `None` when the keysym has no handled mapping (= modifier
+/// keys, function keys we haven't bound).  Caller skips the eval in
+/// that case so the command-loop queue stays clean.
+fn build_event_literal(
+    keyval: gdk::Key,
+    _modifier: gdk::ModifierType,
+) -> Option<String> {
     let name = keyval.name().map(|n| n.to_string()).unwrap_or_default();
     match name.as_str() {
-        "BackSpace" => {
-            r#"(with-current-buffer (get-buffer "*welcome*") (when (> (point) 1) (delete-backward-char 1)))"#
-                .to_string()
-        }
-        "Return" => r#"(with-current-buffer (get-buffer "*welcome*") (newline))"#.to_string(),
-        "Left" => {
-            r#"(with-current-buffer (get-buffer "*welcome*") (when (> (point) 1) (backward-char 1)))"#
-                .to_string()
-        }
-        "Right" => {
-            r#"(with-current-buffer (get-buffer "*welcome*") (when (< (point) (point-max)) (forward-char 1)))"#
-                .to_string()
-        }
-        _ => {
-            if let Some(ch) = keyval.to_unicode().filter(|c| !c.is_control()) {
-                let escaped = match ch {
-                    '"' => "\\\"".to_string(),
-                    '\\' => "\\\\".to_string(),
-                    _ => ch.to_string(),
-                };
-                format!(r#"(with-current-buffer (get-buffer "*welcome*") (insert "{}"))"#, escaped)
-            } else {
-                String::new()
-            }
-        }
+        "BackSpace" => Some("'backspace".into()),
+        "Return" | "KP_Enter" => Some("'return".into()),
+        "Left" => Some("'left".into()),
+        "Right" => Some("'right".into()),
+        "Up" => Some("'up".into()),
+        "Down" => Some("'down".into()),
+        _ => keyval
+            .to_unicode()
+            .filter(|c| !c.is_control())
+            .map(|c| format!("{}", c as u32)),
     }
 }
 
@@ -250,7 +253,7 @@ fn build_initial_state() -> AppState {
     }
     g.put_str_centered(0, " nemacs-gtk ");
     g.put_str_centered(last_row, " close X to quit ");
-    g.put_str_centered(1, "Phase 1.D.2 — interactive buffer editing");
+    g.put_str_centered(1, "Phase 1.D.3b — command-loop-routed dispatch");
 
     let mut session = Session::new();
 
@@ -270,13 +273,23 @@ fn build_initial_state() -> AppState {
         &req_result,
     );
     let buffer_result = session.eval_to_string(welcome_buffer_form());
-    let bootstrap_ok = !req_result.starts_with("ERR ") && !buffer_result.starts_with("ERR ");
+    let keymap_result = session.eval_to_string(nelisp_bridge::command_loop_setup_form());
+    let bootstrap_ok = !req_result.starts_with("ERR ")
+        && !buffer_result.starts_with("ERR ")
+        && !keymap_result.starts_with("ERR ");
     put_probe_row(
         &mut g,
         8,
         "buffer ready",
         "(buffer-name buf)",
-        if bootstrap_ok { &buffer_result } else { &buffer_result },
+        &buffer_result,
+    );
+    put_probe_row(
+        &mut g,
+        9,
+        "keymap ready",
+        "(use-global-map …)",
+        &keymap_result,
     );
 
     g.put_str(10, 2, "*welcome* buffer (live, editable):");
@@ -384,8 +397,9 @@ fn build_ui(app: &Application) {
         // see `st.grid' and `st.session' as disjoint field accesses.
         let app: &mut AppState = &mut st;
         if app.bootstrap_ok {
-            let form = build_dispatch_form(keyval, modifier);
-            if !form.is_empty() {
+            if let Some(literal) = build_event_literal(keyval, modifier) {
+                let form =
+                    nelisp_bridge::command_loop_dispatch_form("*welcome*", &literal);
                 let _ = app.session.eval_to_string(&form);
                 app.cursor = refresh_buffer_area(&mut app.grid, &mut app.session);
             }
@@ -452,6 +466,40 @@ mod tests {
         put_status_line(&mut g, "");
         let row: String = (0..COLS).map(|c| g.get(STATUS_ROW, c)).collect();
         assert!(row.contains("(press any key)"));
+    }
+
+    #[test]
+    fn build_event_literal_maps_named_keys() {
+        let none = gdk::ModifierType::empty();
+        // Letter 'A' → integer literal "65".
+        let a = gdk::Key::from_name("A").expect("'A' keysym");
+        assert_eq!(build_event_literal(a, none), Some("65".into()));
+
+        // Multi-char keysyms → quoted symbol literals.  Each lookup
+        // returns Some(Key) on every gtk4 build that includes the
+        // standard X11 keysym table.
+        for (name, expected) in [
+            ("BackSpace", "'backspace"),
+            ("Return", "'return"),
+            ("Left", "'left"),
+            ("Right", "'right"),
+            ("Up", "'up"),
+            ("Down", "'down"),
+        ] {
+            let k = gdk::Key::from_name(name).expect(name);
+            assert_eq!(
+                build_event_literal(k, none),
+                Some(expected.into()),
+                "keysym {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn build_event_literal_skips_control_chars() {
+        // Control_L is a modifier-only key (no unicode, name = "Control_L").
+        let ctrl = gdk::Key::from_name("Control_L").expect("Control_L");
+        assert_eq!(build_event_literal(ctrl, gdk::ModifierType::empty()), None);
     }
 
     #[test]

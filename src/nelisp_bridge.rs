@@ -134,6 +134,65 @@ pub fn layer2_setup_form() -> String {
     )
 }
 
+/// Phase 1.D.3b — install a minimal global keymap so the substrate's
+/// `emacs-command-loop-step' can resolve our GTK-derived events.
+///
+/// Mirrors the subset of `nemacs-main--init-keymap' (`nemacs-main.el')
+/// that the GUI session actually fires:
+///
+/// - ASCII 32..126 → `self-insert-command'
+/// - byte 13      → `newline'
+/// - byte 127     → `delete-backward-char'
+/// - `'backspace'  → `delete-backward-char'
+/// - `'left'       → `backward-char'
+/// - `'right'      → `forward-char'
+/// - `'up'         → `previous-line'
+/// - `'down'       → `next-line'
+///
+/// Idempotent — calling this twice replaces the previous global map
+/// with a fresh sparse keymap of the same shape.  Layer 2 must already
+/// be loaded (= run `layer2_setup_form' first); this form depends on
+/// the unprefixed aliases provided by `emacs-keymap-builtins' /
+/// `emacs-command-loop-builtins' that `(require 'emacs-init)' chains.
+pub fn command_loop_setup_form() -> &'static str {
+    r#"(progn
+        (let ((m (make-sparse-keymap)))
+          (let ((c 32))
+            (while (<= c 126)
+              (define-key m (vector c) 'self-insert-command)
+              (setq c (1+ c))))
+          (define-key m (vector 13) 'newline)
+          (define-key m (vector 'return) 'newline)
+          (define-key m (vector 'backspace) 'delete-backward-char)
+          (define-key m (vector 127) 'delete-backward-char)
+          (define-key m (vector 'left) 'backward-char)
+          (define-key m (vector 'right) 'forward-char)
+          (define-key m (vector 'up) 'previous-line)
+          (define-key m (vector 'down) 'next-line)
+          (use-global-map m))
+        'keymap-ready)"#
+}
+
+/// Build the elisp form that feeds one event into the substrate
+/// command-loop and runs a single dispatch step against the named
+/// buffer.  EVENT_LITERAL is rendered verbatim into the form: an
+/// integer literal (= "65"), a quoted symbol (= "'backspace"), or any
+/// other reader-acceptable event shape.
+///
+/// The whole step runs inside `with-current-buffer (get-buffer ...)`
+/// so:
+///   1. keymap lookup walks the buffer's local map first (= future
+///      mode-specific bindings),
+///   2. the executed command (= `self-insert-command' / `newline' /
+///      …) sees the right `current-buffer' and edits in place.
+pub fn command_loop_dispatch_form(buffer: &str, event_literal: &str) -> String {
+    format!(
+        r#"(with-current-buffer (get-buffer "{buffer}")
+            (emacs-command-loop-feed-events {event_literal})
+            (emacs-command-loop-step))"#,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -248,6 +307,112 @@ mod tests {
         // outer quotes + decoded \n).
         assert!(r.contains("hello"));
         assert!(r.contains("world"));
+    }
+
+    /// Helper: bring a Session to a state where *welcome* exists and
+    /// the global keymap is wired for the command-loop tests below.
+    fn boot_with_welcome_and_keymap(s: &mut Session) {
+        let setup = s.eval_to_string(&layer2_setup_form());
+        assert!(!setup.starts_with("ERR "), "layer2 setup failed: {setup}");
+        let buf = s.eval_to_string(
+            r#"(progn
+                (require 'emacs-buffer-builtins)
+                (let ((b (or (get-buffer "*welcome*")
+                             (generate-new-buffer "*welcome*"))))
+                  (with-current-buffer b
+                    (erase-buffer)
+                    (insert "> "))
+                  (buffer-name b)))"#,
+        );
+        assert!(!buf.starts_with("ERR "), "welcome setup failed: {buf}");
+        let km = s.eval_to_string(command_loop_setup_form());
+        assert!(!km.starts_with("ERR "), "keymap setup failed: {km}");
+    }
+
+    #[test]
+    fn command_loop_setup_form_returns_keymap_ready() {
+        let mut s = Session::new();
+        boot_with_welcome_and_keymap(&mut s);
+        // Re-running the setup form should still return `keymap-ready'
+        // (= idempotent / second use-global-map replaces the first).
+        let r = s.eval_to_string(command_loop_setup_form());
+        assert_eq!(r, "keymap-ready");
+    }
+
+    #[test]
+    fn command_loop_dispatch_self_insert_round_trip() {
+        let mut s = Session::new();
+        boot_with_welcome_and_keymap(&mut s);
+        // Feed 'X' (= integer 88) → `self-insert-command' → buffer ends
+        // with "> X".
+        let r = s.eval_to_string(&command_loop_dispatch_form("*welcome*", "88"));
+        assert!(!r.starts_with("ERR "), "dispatch failed: {r}");
+        let buf = s.eval_to_string(
+            r#"(with-current-buffer (get-buffer "*welcome*") (buffer-string))"#,
+        );
+        assert!(buf.contains('X'), "expected X in buffer; got {buf}");
+    }
+
+    #[test]
+    fn command_loop_dispatch_backspace_round_trip() {
+        let mut s = Session::new();
+        boot_with_welcome_and_keymap(&mut s);
+        // Insert two chars via command-loop, then backspace one.
+        let _ = s.eval_to_string(&command_loop_dispatch_form("*welcome*", "65"));
+        let _ = s.eval_to_string(&command_loop_dispatch_form("*welcome*", "66"));
+        let buf1 = s.eval_to_string(
+            r#"(with-current-buffer (get-buffer "*welcome*") (buffer-string))"#,
+        );
+        assert!(buf1.contains("AB"), "expected AB after inserts: {buf1}");
+
+        let r = s.eval_to_string(&command_loop_dispatch_form("*welcome*", "'backspace"));
+        assert!(!r.starts_with("ERR "), "backspace dispatch failed: {r}");
+        let buf2 = s.eval_to_string(
+            r#"(with-current-buffer (get-buffer "*welcome*") (buffer-string))"#,
+        );
+        assert!(!buf2.contains("AB"), "B should be deleted: {buf2}");
+        assert!(buf2.contains('A'), "A should survive: {buf2}");
+    }
+
+    #[test]
+    fn command_loop_dispatch_arrow_motion() {
+        let mut s = Session::new();
+        boot_with_welcome_and_keymap(&mut s);
+        // Insert "abc" → point ends at 6 (= "> abc|"), then Left twice
+        // moves point to 4.
+        for code in [97, 98, 99] {
+            let r = s.eval_to_string(&command_loop_dispatch_form(
+                "*welcome*",
+                &code.to_string(),
+            ));
+            assert!(!r.starts_with("ERR "), "insert {code} failed: {r}");
+        }
+        let p1 = s.eval_to_string(
+            r#"(with-current-buffer (get-buffer "*welcome*") (point))"#,
+        );
+        assert_eq!(p1.trim(), "6", "expected point=6 after 3 inserts; got {p1}");
+
+        for _ in 0..2 {
+            let r = s.eval_to_string(&command_loop_dispatch_form("*welcome*", "'left"));
+            assert!(!r.starts_with("ERR "), "left dispatch failed: {r}");
+        }
+        let p2 = s.eval_to_string(
+            r#"(with-current-buffer (get-buffer "*welcome*") (point))"#,
+        );
+        assert_eq!(p2.trim(), "4", "expected point=4 after 2 lefts; got {p2}");
+    }
+
+    #[test]
+    fn command_loop_dispatch_return_inserts_newline() {
+        let mut s = Session::new();
+        boot_with_welcome_and_keymap(&mut s);
+        let r = s.eval_to_string(&command_loop_dispatch_form("*welcome*", "13"));
+        assert!(!r.starts_with("ERR "), "return dispatch failed: {r}");
+        let buf = s.eval_to_string(
+            r#"(with-current-buffer (get-buffer "*welcome*") (buffer-string))"#,
+        );
+        // Buffer was "> "; after newline it should contain a `\n'.
+        assert!(buf.contains("\\n"), "expected newline in buffer; got {buf}");
     }
 
     #[test]
