@@ -93,9 +93,14 @@ fn build_welcome_grid() -> CharGrid {
     let mut session = Session::new();
 
     // ---- Section 1: runtime probes (= Phase 1.C.1 carry-over) -------------
+    // Layout: title / header row / dashes-separator / probe rows.
+    // The dashes go on a row BY THEMSELVES — earlier we wrote them
+    // onto the header row first and then `put_probe_row' on the same
+    // row, which left dashes visible between the column labels.
     g.put_str(4, 2, "Runtime probes");
+    put_probe_row(&mut g, 5, "label", "form", "=>");
     for c in 2..COLS - 2 {
-        g.put(5, c, '-');
+        g.put(6, c, '-');
     }
     let runtime_probes: &[(&str, &str)] = &[
         ("integer arithmetic", "(+ 1 2)"),
@@ -103,24 +108,23 @@ fn build_welcome_grid() -> CharGrid {
         ("nested call",        "(+ (* 3 4) (* 5 6))"),
         ("car . cdr",          "(car (cdr '(a b c)))"),
     ];
-    put_probe_row(&mut g, 5, "label", "form", "=>");
     for (i, (label, form)) in runtime_probes.iter().enumerate() {
-        let row = 6 + i;
+        let row = 7 + i;
         let result = session.eval_to_string(form);
         put_probe_row(&mut g, row, label, form, &result);
     }
 
     // ---- Section 2: Layer 2 probes ---------------------------------------
-    g.put_str(11, 2, "Layer 2 probes (load-path + require)");
+    g.put_str(12, 2, "Layer 2 probes (load-path + require)");
+    put_probe_row(&mut g, 13, "label", "form", "=>");
     for c in 2..COLS - 2 {
-        g.put(12, c, '-');
+        g.put(14, c, '-');
     }
-    put_probe_row(&mut g, 12, "label", "form", "=>");
 
     // Phase 1.C.2 setup: prime the load-path before any require.
     let setup = nelisp_bridge::layer2_setup_form();
     let setup_result = session.eval_to_string(&setup);
-    put_probe_row(&mut g, 13, "load-path setup", "(setq load-path …)", &setup_result);
+    put_probe_row(&mut g, 15, "load-path setup", "(setq load-path …)", &setup_result);
 
     // require + post-require fboundp checks.
     let probes_after_setup: &[(&str, &str)] = &[
@@ -133,7 +137,7 @@ fn build_welcome_grid() -> CharGrid {
          "(condition-case e (user-error \"boom\") (user-error (cadr e)))"),
     ];
     for (i, (label, form)) in probes_after_setup.iter().enumerate() {
-        let row = 14 + i;
+        let row = 16 + i;
         let result = session.eval_to_string(form);
         put_probe_row(&mut g, row, label, form, &result);
     }
