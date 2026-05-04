@@ -163,13 +163,13 @@ fn build_welcome_grid() -> CharGrid {
         g.put(5, c, '-');
     }
 
-    // 1) load-path priming
+    // 1) load-path priming + master substrate require (= emacs-init
+    //    pulls every sibling module in the canonical order).
     let setup_result = session.eval_to_string(&nelisp_bridge::layer2_setup_form());
-    put_probe_row(&mut g, 6, "load-path", "(setq load-path …)", &setup_result);
+    put_probe_row(&mut g, 6, "bootstrap", "(require 'emacs-init)", &setup_result);
 
-    // 2) require the buffer-builtins module — pulls cl-lib +
-    //    nelisp-regex + nelisp-text-buffer + nelisp-emacs-compat
-    //    transitively
+    // 2) `emacs-buffer-builtins' is now already loaded by `emacs-init',
+    //    so this require is just a `featurep' check.
     let req_result = session.eval_to_string("(require 'emacs-buffer-builtins)");
     put_probe_row(
         &mut g,

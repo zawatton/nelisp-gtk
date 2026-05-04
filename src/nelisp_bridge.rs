@@ -88,17 +88,40 @@ pub fn layer2_src_path() -> String {
     candidates[1].clone()
 }
 
-/// Boot form that primes a fresh Session with the Layer 2 load-path.
-/// Returns the elisp source string ready to feed to
-/// [`Session::eval_form`].  Idempotent — safe to run multiple times.
+/// Resolve the NEMACS_HOME-equivalent root (= parent of `src/').
+/// Used to derive `nelisp-emacs-vendor-root' (= `<root>/vendor') which
+/// `emacs-init.el' reads to extend `load-path' with the upstream Emacs
+/// elisp tree.
+pub fn layer2_home_path() -> String {
+    let src = layer2_src_path();
+    if let Some(stripped) = src.strip_suffix("/src") {
+        stripped.to_string()
+    } else {
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+        format!("{}/Notes/dev/nelisp-emacs", home)
+    }
+}
+
+/// Boot form that primes a fresh Session with the Layer 2 load-path
+/// + `nelisp-emacs-vendor-root' + `(require 'emacs-init)' which is the
+/// canonical master require chain pulling in every sibling
+/// substrate module in the correct order (= `bin/nemacs' bash launcher
+/// does the equivalent before `(nemacs-main)').
+///
+/// Idempotent — safe to run multiple times against the same Session.
 pub fn layer2_setup_form() -> String {
+    let src = layer2_src_path();
+    let home = layer2_home_path();
     format!(
         r#"(progn
             (unless (boundp 'load-path) (defvar load-path nil))
             (unless (member "{src}" load-path)
               (setq load-path (cons "{src}" load-path)))
+            (unless (boundp 'nelisp-emacs-vendor-root)
+              (defvar nelisp-emacs-vendor-root nil))
+            (setq nelisp-emacs-vendor-root "{home}/vendor")
+            (require 'emacs-init)
             'load-path-ready)"#,
-        src = layer2_src_path()
     )
 }
 
@@ -169,5 +192,72 @@ mod tests {
         // file exists here — that's a Layer 2 deployment concern.)
         let p = layer2_src_path();
         assert!(p.ends_with("/src"), "{p:?} should end with /src");
+    }
+
+    #[test]
+    fn debug_layer2_path_resolution() {
+        // Print resolved path + check what files exist there.  Only
+        // useful as a diagnostic when we suspect path resolution is
+        // wrong — `cargo test debug_layer2_path_resolution -- --nocapture'
+        // shows the values.
+        let p = layer2_src_path();
+        eprintln!("layer2_src_path = {p}");
+        for f in [
+            "emacs-error.el",
+            "emacs-buffer-builtins.el",
+            "nelisp-emacs-compat.el",
+            "cl-lib.el",
+            "nelisp-regex.el",
+            "nelisp-text-buffer.el",
+        ] {
+            let path = std::path::Path::new(&p).join(f);
+            eprintln!("  {} {}", if path.exists() { "OK" } else { "MISSING" }, f);
+        }
+    }
+
+    #[test]
+    fn welcome_buffer_creation_round_trip() {
+        let mut s = Session::new();
+        s.eval_form(&layer2_setup_form()).unwrap();
+        let r = s.eval_to_string(
+            r#"(progn
+                (require 'emacs-buffer-builtins)
+                (let ((buf (or (get-buffer "*welcome*")
+                               (generate-new-buffer "*welcome*"))))
+                  (with-current-buffer buf
+                    (erase-buffer)
+                    (insert "hello\n")
+                    (insert "world\n")
+                    (buffer-string))))"#,
+        );
+        eprintln!("welcome_buffer => {r}");
+        assert!(
+            !r.starts_with("ERR "),
+            "welcome buffer creation failed: {r}"
+        );
+        // Result should be the printed form of "hello\nworld\n" (= with
+        // outer quotes + decoded \n).
+        assert!(r.contains("hello"));
+        assert!(r.contains("world"));
+    }
+
+    #[test]
+    fn require_emacs_buffer_builtins_through_session() {
+        // Reproduces the GUI bootstrap failure outside the display loop.
+        let mut s = Session::new();
+        let setup = s.eval_to_string(&layer2_setup_form());
+        eprintln!("setup => {setup}");
+        let lp = s.eval_to_string("(car load-path)");
+        eprintln!("(car load-path) => {lp}");
+        let r = s.eval_to_string("(require 'emacs-buffer-builtins)");
+        eprintln!("(require 'emacs-buffer-builtins) => {r}");
+        // Soft assertion — just don't panic; the eprintln output is the
+        // diagnostic we actually care about.  If the require succeeds
+        // we're good; if it fails the eprintln above shows the error.
+        if r.starts_with("ERR ") {
+            // Try the older path-existing fallback too.
+            let r2 = s.eval_to_string("(require 'emacs-error)");
+            eprintln!("(require 'emacs-error) fallback => {r2}");
+        }
     }
 }
