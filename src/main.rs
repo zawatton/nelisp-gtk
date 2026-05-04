@@ -1,42 +1,44 @@
-// Phase 1.C.3 — Layer 2 buffer state painted into the GTK grid.
+// Phase 1.D.1 — capture GTK key events and surface the most recent
+// keystroke in the grid.
 //
-// 1.C.2 demonstrated that a single Layer-2 module (`emacs-error') could
-// be `(require)'-ed against a persistent NeLisp Session.  This phase
-// scales that up:
+// 1.C.3 painted the *welcome* buffer once at startup.  This phase adds
+// shared mutable state (`Rc<RefCell<AppState>>') so the key controller
+// can mutate the grid AFTER the initial paint and trigger a repaint
+// via `queue_draw' — the substrate boilerplate Phase 1.D.2 will use
+// to forward events into `emacs-command-loop' and re-mirror the
+// updated buffer.
 //
-//   - Run the smallest non-trivial slice of Layer 2 that yields a
-//     working buffer abstraction (`generate-new-buffer' / `insert' /
-//     `buffer-string').  The transitive require chain for
-//     `emacs-buffer-builtins' is `cl-lib' → `nelisp-regex' →
-//     `nelisp-text-buffer' → `nelisp-emacs-compat' →
-//     `emacs-buffer-builtins'.
-//
-//   - On the elisp side, populate a `*welcome*' buffer with a multi-line
-//     greeting then yield `(buffer-string)' back across the Rust boundary.
-//
-//   - On the Rust side, split the returned string on '\n' and stamp each
-//     line into the central area of the `CharGrid', so the GTK window
-//     literally mirrors the Layer-2 buffer content.
-//
-// Phase 1.D will replace the static greeting with a live event-driven
-// redraw: keystrokes routed through `emacs-command-loop' mutate the
-// buffer, the substrate calls back into a redraw bridge, and Pango
-// repaints the affected cells.
+// Phase 1.D.2 (next): translate `gdk::Key' values into the symbolic
+// representation `emacs-tui-event' / `emacs-command-loop' expect, push
+// them via `(emacs-command-loop-feed-events ...)' / `(emacs-command-
+// loop-step)', then re-query `(buffer-string)' and stamp the result
+// into the buffer-mirror rows so live editing becomes visible.
 
 mod grid;
 mod nelisp_bridge;
+
+use std::cell::RefCell;
+use std::rc::Rc;
 
 use grid::CharGrid;
 use gtk::pango;
 use gtk::pango::FontDescription;
 use gtk::prelude::*;
-use gtk::{glib, Application, ApplicationWindow, DrawingArea};
+use gtk::{glib, Application, ApplicationWindow, DrawingArea, EventControllerKey};
 use nelisp_bridge::Session;
 
 const APP_ID: &str = "org.nelisp.emacs.gtk";
 const ROWS: usize = 24;
 const COLS: usize = 80;
 const FONT: &str = "Monospace 12";
+
+/// Shared GUI state.  Mutated by the key controller, read by the draw
+/// callback — both paths pass through `Rc<RefCell<_>>' so the
+/// gtk4 single-threaded model keeps the borrows safe.
+struct AppState {
+    grid: CharGrid,
+    last_key: String,
+}
 
 fn main() -> glib::ExitCode {
     let app = Application::builder().application_id(APP_ID).build();
@@ -57,7 +59,6 @@ fn measure_cell() -> (f64, f64, f64) {
     (cell_w, ascent + descent, ascent)
 }
 
-/// Truncate `s' to `max' characters with a one-char ellipsis suffix.
 fn truncate_to(mut s: String, max: usize) -> String {
     if s.chars().count() > max {
         let cut: String = s.chars().take(max.saturating_sub(1)).collect();
@@ -67,7 +68,6 @@ fn truncate_to(mut s: String, max: usize) -> String {
     s
 }
 
-/// Render a probe row (label / form / result) into the grid.
 fn put_probe_row(g: &mut CharGrid, row: usize, label: &str, form: &str, result: &str) {
     const LABEL_COL: usize = 2;
     const FORM_COL: usize = 22;
@@ -77,9 +77,6 @@ fn put_probe_row(g: &mut CharGrid, row: usize, label: &str, form: &str, result: 
     g.put_str(row, RESULT_COL, &truncate_to(result.to_string(), COLS - RESULT_COL - 1));
 }
 
-/// Elisp form that sets up the *welcome* buffer in the Session and
-/// returns its full text.  Runs once per process; after this the
-/// buffer is reachable via `(get-buffer "*welcome*")'.
 fn welcome_buffer_form() -> &'static str {
     r#"(progn
         (require 'emacs-buffer-builtins)
@@ -94,21 +91,14 @@ fn welcome_buffer_form() -> &'static str {
             (insert "  (generate-new-buffer \"*welcome*\")\n")
             (insert "  (with-current-buffer ... (insert ...))\n")
             (insert "\n")
-            (insert "The Rust GUI side then queried (buffer-string)\n")
-            (insert "and painted these cells via Pango/Cairo.\n")
-            (insert "\n")
-            (insert "Phase 1.C.3 — Layer 2 buffer mirror.\n")
+            (insert "Phase 1.D.1 — type any key; the row at the bottom\n")
+            (insert "will mirror the keystroke captured by GTK.\n")
             (buffer-string))))"#
 }
 
-/// Strip outer quotes from a NeLisp printed string ("...") so we can
-/// stamp the raw bytes into the grid.  Falls through unchanged for
-/// non-quoted return values (e.g. error messages).
 fn unquote_printed(s: &str) -> String {
     let bytes = s.as_bytes();
     if bytes.len() >= 2 && bytes[0] == b'"' && bytes[bytes.len() - 1] == b'"' {
-        // Decode the small subset of escapes the NeLisp printer emits:
-        // \n \t \\ \"
         let inner = &s[1..s.len() - 1];
         let mut out = String::with_capacity(inner.len());
         let mut chars = inner.chars();
@@ -135,12 +125,27 @@ fn unquote_printed(s: &str) -> String {
     }
 }
 
-fn build_welcome_grid() -> CharGrid {
+const STATUS_ROW: usize = ROWS - 2;
+
+/// Stamp the "Last key" status line into the grid, clearing the row first
+/// so a long previous label doesn't bleed past the current text.
+fn put_status_line(g: &mut CharGrid, last_key: &str) {
+    for c in 2..(COLS - 2) {
+        g.put(STATUS_ROW, c, ' ');
+    }
+    let text = if last_key.is_empty() {
+        "(press any key)".to_string()
+    } else {
+        format!("Last key: {last_key}")
+    };
+    g.put_str(STATUS_ROW, 2, &truncate_to(text, COLS - 4));
+}
+
+fn build_initial_grid() -> CharGrid {
     let mut g = CharGrid::blank(ROWS, COLS);
     let last_row = ROWS - 1;
     let last_col = COLS - 1;
 
-    // Decorative border + corner markers.
     g.put(0, 0, '+');
     g.put(0, last_col, '+');
     g.put(last_row, 0, '+');
@@ -151,25 +156,18 @@ fn build_welcome_grid() -> CharGrid {
     }
     g.put_str_centered(0, " nemacs-gtk ");
     g.put_str_centered(last_row, " close X to quit ");
-
-    g.put_str_centered(1, "Phase 1.C.3 — Layer 2 buffer mirror");
+    g.put_str_centered(1, "Phase 1.D.1 — keyboard event capture");
 
     let mut session = Session::new();
 
-    // ---- Section A: bootstrap ---------------------------------------------
     g.put_str(3, 2, "Bootstrap");
     put_probe_row(&mut g, 4, "step", "form", "=>");
     for c in 2..COLS - 2 {
         g.put(5, c, '-');
     }
-
-    // 1) load-path priming + master substrate require (= emacs-init
-    //    pulls every sibling module in the canonical order).
     let setup_result = session.eval_to_string(&nelisp_bridge::layer2_setup_form());
     put_probe_row(&mut g, 6, "bootstrap", "(require 'emacs-init)", &setup_result);
 
-    // 2) `emacs-buffer-builtins' is now already loaded by `emacs-init',
-    //    so this require is just a `featurep' check.
     let req_result = session.eval_to_string("(require 'emacs-buffer-builtins)");
     put_probe_row(
         &mut g,
@@ -179,9 +177,7 @@ fn build_welcome_grid() -> CharGrid {
         &req_result,
     );
 
-    // 3) build the welcome buffer + read its content back as a string
     let buffer_result = session.eval_to_string(welcome_buffer_form());
-
     let bootstrap_ok = !req_result.starts_with("ERR ") && !buffer_result.starts_with("ERR ");
     put_probe_row(
         &mut g,
@@ -191,15 +187,12 @@ fn build_welcome_grid() -> CharGrid {
         if bootstrap_ok { "<see below>" } else { &buffer_result },
     );
 
-    // ---- Section B: rendered buffer --------------------------------------
     g.put_str(10, 2, "*welcome* buffer (mirrored from Layer 2):");
     for c in 2..COLS - 2 {
         g.put(11, c, '-');
     }
-
-    // Buffer content rows 12..21 (10 rows of capacity).
     let content_start_row = 12usize;
-    let content_max_rows = 10usize;
+    let content_max_rows = (STATUS_ROW.saturating_sub(content_start_row)).saturating_sub(1);
     let content = if bootstrap_ok {
         unquote_printed(&buffer_result)
     } else {
@@ -209,6 +202,12 @@ fn build_welcome_grid() -> CharGrid {
         g.put_str(content_start_row + i, 4, line);
     }
 
+    // Status separator + initial prompt line.
+    for c in 2..COLS - 2 {
+        g.put(STATUS_ROW - 1, c, '-');
+    }
+    put_status_line(&mut g, "");
+
     g
 }
 
@@ -217,12 +216,16 @@ fn build_ui(app: &Application) {
     let canvas_w = (cell_w * COLS as f64).ceil() as i32;
     let canvas_h = (cell_h * ROWS as f64).ceil() as i32;
 
-    let g = build_welcome_grid();
+    let state = Rc::new(RefCell::new(AppState {
+        grid: build_initial_grid(),
+        last_key: String::new(),
+    }));
 
     let area = DrawingArea::new();
     area.set_content_width(canvas_w);
     area.set_content_height(canvas_h);
 
+    let state_for_draw = state.clone();
     area.set_draw_func(move |_area, cr, _w, _h| {
         cr.set_source_rgb(1.0, 1.0, 1.0);
         let _ = cr.paint();
@@ -232,10 +235,11 @@ fn build_ui(app: &Application) {
         let desc = FontDescription::from_string(FONT);
         layout.set_font_description(Some(&desc));
 
+        let st = state_for_draw.borrow();
         let mut buf = [0u8; 4];
-        for row in 0..g.rows {
-            for col in 0..g.cols {
-                let ch = g.get(row, col);
+        for row in 0..st.grid.rows {
+            for col in 0..st.grid.cols {
+                let ch = st.grid.get(row, col);
                 if ch == ' ' {
                     continue;
                 }
@@ -246,12 +250,41 @@ fn build_ui(app: &Application) {
         }
     });
 
+    // Phase 1.D.1: capture every key press and surface its keysym name
+    // + held modifiers in the status row.  No substrate dispatch yet —
+    // 1.D.2 will translate `repr' to an `emacs-tui-event' representation
+    // and call `(emacs-command-loop-feed-events ...)'.
+    let key_controller = EventControllerKey::new();
+    let state_for_key = state.clone();
+    let area_for_key = area.clone();
+    key_controller.connect_key_pressed(move |_, keyval, _keycode, modifier| {
+        let name = keyval.name().map(|n| n.to_string()).unwrap_or_else(|| "?".into());
+        let mods = if modifier.is_empty() {
+            String::new()
+        } else {
+            format!(" mod={modifier:?}")
+        };
+        let unicode = keyval
+            .to_unicode()
+            .filter(|c| !c.is_control())
+            .map(|c| format!(" '{c}'"))
+            .unwrap_or_default();
+        let repr = format!("{name}{mods}{unicode}");
+        let mut st = state_for_key.borrow_mut();
+        st.last_key = repr.clone();
+        put_status_line(&mut st.grid, &repr);
+        drop(st);
+        area_for_key.queue_draw();
+        glib::Propagation::Proceed
+    });
+
     let window = ApplicationWindow::builder()
         .application(app)
         .title("nemacs-gtk")
         .resizable(false)
         .child(&area)
         .build();
+    window.add_controller(key_controller);
     window.present();
 }
 
@@ -282,5 +315,25 @@ mod tests {
     #[test]
     fn truncate_to_appends_ellipsis_on_overflow() {
         assert_eq!(truncate_to("abcdef".to_string(), 4), "abc…");
+    }
+
+    #[test]
+    fn put_status_line_clears_previous_text() {
+        let mut g = CharGrid::blank(ROWS, COLS);
+        put_status_line(&mut g, "very-long-keysym-name");
+        put_status_line(&mut g, "a");
+        // After the second put, only "Last key: a" should remain — the
+        // long suffix from the first call must be cleared.
+        let row: String = (0..COLS).map(|c| g.get(STATUS_ROW, c)).collect();
+        assert!(row.contains("Last key: a"));
+        assert!(!row.contains("very-long"));
+    }
+
+    #[test]
+    fn put_status_line_initial_empty_shows_prompt() {
+        let mut g = CharGrid::blank(ROWS, COLS);
+        put_status_line(&mut g, "");
+        let row: String = (0..COLS).map(|c| g.get(STATUS_ROW, c)).collect();
+        assert!(row.contains("(press any key)"));
     }
 }
