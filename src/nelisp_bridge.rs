@@ -57,7 +57,10 @@ impl Session {
 /// Resolve the Layer 2 elisp source root.  Search order:
 ///   1. `NEMACS_HOME` env var     → `$NEMACS_HOME/src`
 ///   2. `NEMACS_LAYER2_SRC` env var (= explicit override)
-///   3. `$HOME/Notes/dev/nelisp-emacs/src` (= canonical dev layout)
+///   3. The active dev worktree (= where nelisp-emacs-compat.el currently lives)
+///   4. The canonical clone  (= older snapshot, may be missing recent files)
+///   5. Canonical-clone path returned regardless so first probe surfaces a
+///      clear "file not found" error.
 pub fn layer2_src_path() -> String {
     if let Ok(home) = std::env::var("NEMACS_HOME") {
         return format!("{}/src", home.trim_end_matches('/'));
@@ -66,7 +69,23 @@ pub fn layer2_src_path() -> String {
         return p;
     }
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-    format!("{}/Notes/dev/nelisp-emacs/src", home)
+    let candidates = [
+        format!(
+            "{home}/Cowork/Notes/dev/nelisp-emacs/.worktrees/emacs-builtins-port/src"
+        ),
+        format!("{home}/Notes/dev/nelisp-emacs/src"),
+    ];
+    for c in &candidates {
+        if std::path::Path::new(c)
+            .join("nelisp-emacs-compat.el")
+            .exists()
+        {
+            return c.clone();
+        }
+    }
+    // Fallback: canonical clone path (= older snapshot path, kept stable
+    // for users who haven't yet checked out the latest substrate).
+    candidates[1].clone()
 }
 
 /// Boot form that primes a fresh Session with the Layer 2 load-path.

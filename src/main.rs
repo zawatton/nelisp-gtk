@@ -1,19 +1,27 @@
-// Phase 1.C.2 — embedded NeLisp + Layer 2 elisp `(require ...)' chain.
+// Phase 1.C.3 — Layer 2 buffer state painted into the GTK grid.
 //
-// Phase 1.C.1 proved the embedded interpreter could evaluate plain
-// elisp arithmetic / list ops in a fresh global env.  This phase adds:
+// 1.C.2 demonstrated that a single Layer-2 module (`emacs-error') could
+// be `(require)'-ed against a persistent NeLisp Session.  This phase
+// scales that up:
 //
-//   - a long-lived `Session' (= persistent Env) so successive evals
-//     share state, mirroring the canonical `bin/nemacs' boot flow
-//   - `load-path' priming pointing at `nelisp-emacs/src/' (Layer 2)
-//   - `(require 'emacs-error)' as the smallest sanity-check Layer-2
-//     module, with follow-up probes confirming the polyfilled
-//     `user-error' / `display-warning' / `define-error' symbols are
-//     reachable in the same session afterwards
+//   - Run the smallest non-trivial slice of Layer 2 that yields a
+//     working buffer abstraction (`generate-new-buffer' / `insert' /
+//     `buffer-string').  The transitive require chain for
+//     `emacs-buffer-builtins' is `cl-lib' → `nelisp-regex' →
+//     `nelisp-text-buffer' → `nelisp-emacs-compat' →
+//     `emacs-buffer-builtins'.
 //
-// Phase 1.C.3 will replace this static welcome paint with a redraw
-// triggered after each command-loop step (= a logical-buffer mirror
-// driven by the embedded runtime).
+//   - On the elisp side, populate a `*welcome*' buffer with a multi-line
+//     greeting then yield `(buffer-string)' back across the Rust boundary.
+//
+//   - On the Rust side, split the returned string on '\n' and stamp each
+//     line into the central area of the `CharGrid', so the GTK window
+//     literally mirrors the Layer-2 buffer content.
+//
+// Phase 1.D will replace the static greeting with a live event-driven
+// redraw: keystrokes routed through `emacs-command-loop' mutate the
+// buffer, the substrate calls back into a redraw bridge, and Pango
+// repaints the affected cells.
 
 mod grid;
 mod nelisp_bridge;
@@ -52,7 +60,6 @@ fn measure_cell() -> (f64, f64, f64) {
 /// Truncate `s' to `max' characters with a one-char ellipsis suffix.
 fn truncate_to(mut s: String, max: usize) -> String {
     if s.chars().count() > max {
-        // Char-safe truncate: keep `max - 1' chars then append ellipsis.
         let cut: String = s.chars().take(max.saturating_sub(1)).collect();
         s = cut;
         s.push('…');
@@ -70,6 +77,64 @@ fn put_probe_row(g: &mut CharGrid, row: usize, label: &str, form: &str, result: 
     g.put_str(row, RESULT_COL, &truncate_to(result.to_string(), COLS - RESULT_COL - 1));
 }
 
+/// Elisp form that sets up the *welcome* buffer in the Session and
+/// returns its full text.  Runs once per process; after this the
+/// buffer is reachable via `(get-buffer "*welcome*")'.
+fn welcome_buffer_form() -> &'static str {
+    r#"(progn
+        (require 'emacs-buffer-builtins)
+        (let ((buf (or (get-buffer "*welcome*")
+                       (generate-new-buffer "*welcome*"))))
+          (with-current-buffer buf
+            (erase-buffer)
+            (insert "Welcome to nemacs-gtk\n")
+            (insert "=====================\n")
+            (insert "\n")
+            (insert "This buffer was created in Layer-2 elisp via:\n")
+            (insert "  (generate-new-buffer \"*welcome*\")\n")
+            (insert "  (with-current-buffer ... (insert ...))\n")
+            (insert "\n")
+            (insert "The Rust GUI side then queried (buffer-string)\n")
+            (insert "and painted these cells via Pango/Cairo.\n")
+            (insert "\n")
+            (insert "Phase 1.C.3 — Layer 2 buffer mirror.\n")
+            (buffer-string))))"#
+}
+
+/// Strip outer quotes from a NeLisp printed string ("...") so we can
+/// stamp the raw bytes into the grid.  Falls through unchanged for
+/// non-quoted return values (e.g. error messages).
+fn unquote_printed(s: &str) -> String {
+    let bytes = s.as_bytes();
+    if bytes.len() >= 2 && bytes[0] == b'"' && bytes[bytes.len() - 1] == b'"' {
+        // Decode the small subset of escapes the NeLisp printer emits:
+        // \n \t \\ \"
+        let inner = &s[1..s.len() - 1];
+        let mut out = String::with_capacity(inner.len());
+        let mut chars = inner.chars();
+        while let Some(c) = chars.next() {
+            if c == '\\' {
+                match chars.next() {
+                    Some('n') => out.push('\n'),
+                    Some('t') => out.push('\t'),
+                    Some('\\') => out.push('\\'),
+                    Some('"') => out.push('"'),
+                    Some(other) => {
+                        out.push('\\');
+                        out.push(other);
+                    }
+                    None => out.push('\\'),
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    } else {
+        s.to_string()
+    }
+}
+
 fn build_welcome_grid() -> CharGrid {
     let mut g = CharGrid::blank(ROWS, COLS);
     let last_row = ROWS - 1;
@@ -84,67 +149,65 @@ fn build_welcome_grid() -> CharGrid {
         g.put(0, c, '-');
         g.put(last_row, c, '-');
     }
-
     g.put_str_centered(0, " nemacs-gtk ");
-    g.put_str_centered(2, "Phase 1.C.2 — embedded NeLisp + Layer 2 elisp");
+    g.put_str_centered(last_row, " close X to quit ");
 
-    // Single Session shared by every probe so `(setq ...)` / `(require ...)`
-    // performed by an earlier probe is visible to a later one.
+    g.put_str_centered(1, "Phase 1.C.3 — Layer 2 buffer mirror");
+
     let mut session = Session::new();
 
-    // ---- Section 1: runtime probes (= Phase 1.C.1 carry-over) -------------
-    // Layout: title / header row / dashes-separator / probe rows.
-    // The dashes go on a row BY THEMSELVES — earlier we wrote them
-    // onto the header row first and then `put_probe_row' on the same
-    // row, which left dashes visible between the column labels.
-    g.put_str(4, 2, "Runtime probes");
-    put_probe_row(&mut g, 5, "label", "form", "=>");
+    // ---- Section A: bootstrap ---------------------------------------------
+    g.put_str(3, 2, "Bootstrap");
+    put_probe_row(&mut g, 4, "step", "form", "=>");
     for c in 2..COLS - 2 {
-        g.put(6, c, '-');
-    }
-    let runtime_probes: &[(&str, &str)] = &[
-        ("integer arithmetic", "(+ 1 2)"),
-        ("multiplication",     "(* 7 8)"),
-        ("nested call",        "(+ (* 3 4) (* 5 6))"),
-        ("car . cdr",          "(car (cdr '(a b c)))"),
-    ];
-    for (i, (label, form)) in runtime_probes.iter().enumerate() {
-        let row = 7 + i;
-        let result = session.eval_to_string(form);
-        put_probe_row(&mut g, row, label, form, &result);
+        g.put(5, c, '-');
     }
 
-    // ---- Section 2: Layer 2 probes ---------------------------------------
-    g.put_str(12, 2, "Layer 2 probes (load-path + require)");
-    put_probe_row(&mut g, 13, "label", "form", "=>");
+    // 1) load-path priming
+    let setup_result = session.eval_to_string(&nelisp_bridge::layer2_setup_form());
+    put_probe_row(&mut g, 6, "load-path", "(setq load-path …)", &setup_result);
+
+    // 2) require the buffer-builtins module — pulls cl-lib +
+    //    nelisp-regex + nelisp-text-buffer + nelisp-emacs-compat
+    //    transitively
+    let req_result = session.eval_to_string("(require 'emacs-buffer-builtins)");
+    put_probe_row(
+        &mut g,
+        7,
+        "require buffer",
+        "(require 'emacs-buffer-builtins)",
+        &req_result,
+    );
+
+    // 3) build the welcome buffer + read its content back as a string
+    let buffer_result = session.eval_to_string(welcome_buffer_form());
+
+    let bootstrap_ok = !req_result.starts_with("ERR ") && !buffer_result.starts_with("ERR ");
+    put_probe_row(
+        &mut g,
+        8,
+        "buffer ready",
+        "(buffer-string)",
+        if bootstrap_ok { "<see below>" } else { &buffer_result },
+    );
+
+    // ---- Section B: rendered buffer --------------------------------------
+    g.put_str(10, 2, "*welcome* buffer (mirrored from Layer 2):");
     for c in 2..COLS - 2 {
-        g.put(14, c, '-');
+        g.put(11, c, '-');
     }
 
-    // Phase 1.C.2 setup: prime the load-path before any require.
-    let setup = nelisp_bridge::layer2_setup_form();
-    let setup_result = session.eval_to_string(&setup);
-    put_probe_row(&mut g, 15, "load-path setup", "(setq load-path …)", &setup_result);
-
-    // require + post-require fboundp checks.
-    let probes_after_setup: &[(&str, &str)] = &[
-        ("require emacs-error",  "(require 'emacs-error)"),
-        ("fboundp user-error",   "(fboundp 'user-error)"),
-        ("fboundp define-error", "(fboundp 'define-error)"),
-        ("define-error works",
-         "(progn (define-error 'my-test \"my\") (get 'my-test 'error-message))"),
-        ("user-error catches",
-         "(condition-case e (user-error \"boom\") (user-error (cadr e)))"),
-    ];
-    for (i, (label, form)) in probes_after_setup.iter().enumerate() {
-        let row = 16 + i;
-        let result = session.eval_to_string(form);
-        put_probe_row(&mut g, row, label, form, &result);
+    // Buffer content rows 12..21 (10 rows of capacity).
+    let content_start_row = 12usize;
+    let content_max_rows = 10usize;
+    let content = if bootstrap_ok {
+        unquote_printed(&buffer_result)
+    } else {
+        format!("[bootstrap failed]\n{buffer_result}")
+    };
+    for (i, line) in content.lines().take(content_max_rows).enumerate() {
+        g.put_str(content_start_row + i, 4, line);
     }
-
-    // Footer.
-    g.put_str_centered(last_row - 1, "Layer 2 elisp loaded into a single embedded NeLisp session");
-    g.put_str_centered(last_row, " close X to quit ");
 
     g
 }
@@ -190,4 +253,34 @@ fn build_ui(app: &Application) {
         .child(&area)
         .build();
     window.present();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unquote_printed_strips_outer_quotes() {
+        assert_eq!(unquote_printed("\"hello\""), "hello");
+    }
+
+    #[test]
+    fn unquote_printed_decodes_newline_escape() {
+        assert_eq!(unquote_printed("\"a\\nb\""), "a\nb");
+    }
+
+    #[test]
+    fn unquote_printed_passes_through_unquoted() {
+        assert_eq!(unquote_printed("ERR foo"), "ERR foo");
+    }
+
+    #[test]
+    fn truncate_to_keeps_short_strings_intact() {
+        assert_eq!(truncate_to("abc".to_string(), 10), "abc");
+    }
+
+    #[test]
+    fn truncate_to_appends_ellipsis_on_overflow() {
+        assert_eq!(truncate_to("abcdef".to_string(), 4), "abc…");
+    }
 }
