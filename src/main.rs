@@ -1,14 +1,19 @@
-// Phase 1.C.1 — embed NeLisp runtime + render eval results in the grid.
+// Phase 1.C.2 — embedded NeLisp + Layer 2 elisp `(require ...)' chain.
 //
-// Builds on Phase 1.B's Pango monospace grid by replacing the static
-// diagonal-and-dots pattern with a precomputed `CharGrid' that holds
-// the textual readout of a few NeLisp eval probes — proving the
-// embedded interpreter is alive and reachable from the GTK main thread.
+// Phase 1.C.1 proved the embedded interpreter could evaluate plain
+// elisp arithmetic / list ops in a fresh global env.  This phase adds:
 //
-// Phase 1.C.2 will add load-path + `(require '...)' so we can pull in
-// Layer 2 elisp from `nelisp-emacs/src/'.  Phase 1.C.3 will replace the
-// startup-only fill with a redraw triggered after each command-loop
-// step, mirroring how the TUI driver repaints the terminal grid.
+//   - a long-lived `Session' (= persistent Env) so successive evals
+//     share state, mirroring the canonical `bin/nemacs' boot flow
+//   - `load-path' priming pointing at `nelisp-emacs/src/' (Layer 2)
+//   - `(require 'emacs-error)' as the smallest sanity-check Layer-2
+//     module, with follow-up probes confirming the polyfilled
+//     `user-error' / `display-warning' / `define-error' symbols are
+//     reachable in the same session afterwards
+//
+// Phase 1.C.3 will replace this static welcome paint with a redraw
+// triggered after each command-loop step (= a logical-buffer mirror
+// driven by the embedded runtime).
 
 mod grid;
 mod nelisp_bridge;
@@ -18,6 +23,7 @@ use gtk::pango;
 use gtk::pango::FontDescription;
 use gtk::prelude::*;
 use gtk::{glib, Application, ApplicationWindow, DrawingArea};
+use nelisp_bridge::Session;
 
 const APP_ID: &str = "org.nelisp.emacs.gtk";
 const ROWS: usize = 24;
@@ -43,15 +49,33 @@ fn measure_cell() -> (f64, f64, f64) {
     (cell_w, ascent + descent, ascent)
 }
 
-/// Build the static welcome grid for Phase 1.C.1 — header, NeLisp probe
-/// results, footer.  Visible proof that `nelisp::eval::eval_str' is wired
-/// up and produces correct values from inside the GTK process.
+/// Truncate `s' to `max' characters with a one-char ellipsis suffix.
+fn truncate_to(mut s: String, max: usize) -> String {
+    if s.chars().count() > max {
+        // Char-safe truncate: keep `max - 1' chars then append ellipsis.
+        let cut: String = s.chars().take(max.saturating_sub(1)).collect();
+        s = cut;
+        s.push('…');
+    }
+    s
+}
+
+/// Render a probe row (label / form / result) into the grid.
+fn put_probe_row(g: &mut CharGrid, row: usize, label: &str, form: &str, result: &str) {
+    const LABEL_COL: usize = 2;
+    const FORM_COL: usize = 22;
+    const RESULT_COL: usize = 50;
+    g.put_str(row, LABEL_COL, label);
+    g.put_str(row, FORM_COL, form);
+    g.put_str(row, RESULT_COL, &truncate_to(result.to_string(), COLS - RESULT_COL - 1));
+}
+
 fn build_welcome_grid() -> CharGrid {
     let mut g = CharGrid::blank(ROWS, COLS);
-
-    // Border decoration (corner markers + thin top/bottom lines).
     let last_row = ROWS - 1;
     let last_col = COLS - 1;
+
+    // Decorative border + corner markers.
     g.put(0, 0, '+');
     g.put(0, last_col, '+');
     g.put(last_row, 0, '+');
@@ -61,59 +85,71 @@ fn build_welcome_grid() -> CharGrid {
         g.put(last_row, c, '-');
     }
 
-    // Headers
     g.put_str_centered(0, " nemacs-gtk ");
-    g.put_str_centered(2, "Phase 1.C.1 — embedded NeLisp runtime sanity check");
+    g.put_str_centered(2, "Phase 1.C.2 — embedded NeLisp + Layer 2 elisp");
 
-    // Probe lines.  Each row shows form + result (or ERR ...).
-    let probes: &[(&str, &str)] = &[
+    // Single Session shared by every probe so `(setq ...)` / `(require ...)`
+    // performed by an earlier probe is visible to a later one.
+    let mut session = Session::new();
+
+    // ---- Section 1: runtime probes (= Phase 1.C.1 carry-over) -------------
+    g.put_str(4, 2, "Runtime probes");
+    for c in 2..COLS - 2 {
+        g.put(5, c, '-');
+    }
+    let runtime_probes: &[(&str, &str)] = &[
         ("integer arithmetic", "(+ 1 2)"),
         ("multiplication",     "(* 7 8)"),
-        ("string concat",      "(concat \"hello, \" \"world\")"),
-        ("list length",        "(length '(a b c d e))"),
         ("nested call",        "(+ (* 3 4) (* 5 6))"),
-        ("cons + car/cdr",     "(car (cdr '(a b c)))"),
+        ("car . cdr",          "(car (cdr '(a b c)))"),
     ];
-    let label_col = 2usize;
-    let form_col = 22usize;
-    let result_col = 50usize;
-    g.put_str(4, label_col, "label");
-    g.put_str(4, form_col, "form");
-    g.put_str(4, result_col, "=>");
-    for c in 0..(COLS - 4) {
-        g.put(5, c + 2, '-');
-    }
-    for (i, (label, form)) in probes.iter().enumerate() {
+    put_probe_row(&mut g, 5, "label", "form", "=>");
+    for (i, (label, form)) in runtime_probes.iter().enumerate() {
         let row = 6 + i;
-        g.put_str(row, label_col, label);
-        g.put_str(row, form_col, form);
-        let mut result = nelisp_bridge::eval_to_string(form);
-        // Truncate so the result column never overflows the grid.
-        let max_result_len = COLS - result_col - 1;
-        if result.chars().count() > max_result_len {
-            result.truncate(max_result_len);
-            result.push('…');
-        }
-        g.put_str(row, result_col, &result);
+        let result = session.eval_to_string(form);
+        put_probe_row(&mut g, row, label, form, &result);
     }
 
-    // Footer
-    g.put_str_centered(
-        last_row - 2,
-        "All probes evaluated by the embedded NeLisp runtime",
-    );
+    // ---- Section 2: Layer 2 probes ---------------------------------------
+    g.put_str(11, 2, "Layer 2 probes (load-path + require)");
+    for c in 2..COLS - 2 {
+        g.put(12, c, '-');
+    }
+    put_probe_row(&mut g, 12, "label", "form", "=>");
+
+    // Phase 1.C.2 setup: prime the load-path before any require.
+    let setup = nelisp_bridge::layer2_setup_form();
+    let setup_result = session.eval_to_string(&setup);
+    put_probe_row(&mut g, 13, "load-path setup", "(setq load-path …)", &setup_result);
+
+    // require + post-require fboundp checks.
+    let probes_after_setup: &[(&str, &str)] = &[
+        ("require emacs-error",  "(require 'emacs-error)"),
+        ("fboundp user-error",   "(fboundp 'user-error)"),
+        ("fboundp define-error", "(fboundp 'define-error)"),
+        ("define-error works",
+         "(progn (define-error 'my-test \"my\") (get 'my-test 'error-message))"),
+        ("user-error catches",
+         "(condition-case e (user-error \"boom\") (user-error (cadr e)))"),
+    ];
+    for (i, (label, form)) in probes_after_setup.iter().enumerate() {
+        let row = 14 + i;
+        let result = session.eval_to_string(form);
+        put_probe_row(&mut g, row, label, form, &result);
+    }
+
+    // Footer.
+    g.put_str_centered(last_row - 1, "Layer 2 elisp loaded into a single embedded NeLisp session");
     g.put_str_centered(last_row, " close X to quit ");
 
     g
 }
 
 fn build_ui(app: &Application) {
-    let (cell_w, cell_h, ascent) = measure_cell();
+    let (cell_w, cell_h, _ascent) = measure_cell();
     let canvas_w = (cell_w * COLS as f64).ceil() as i32;
     let canvas_h = (cell_h * ROWS as f64).ceil() as i32;
 
-    // Compute the grid once at startup.  Future phases will refresh on
-    // every command-loop step and queue_draw().
     let g = build_welcome_grid();
 
     let area = DrawingArea::new();
@@ -141,7 +177,6 @@ fn build_ui(app: &Application) {
                 pangocairo::functions::show_layout(cr, &layout);
             }
         }
-        let _ = ascent; // reserved for baseline-precise rendering in 1.C.3
     });
 
     let window = ApplicationWindow::builder()
