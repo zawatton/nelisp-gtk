@@ -57,10 +57,13 @@ impl Session {
 /// Resolve the Layer 2 elisp source root.  Search order:
 ///   1. `NEMACS_HOME` env var     → `$NEMACS_HOME/src`
 ///   2. `NEMACS_LAYER2_SRC` env var (= explicit override)
-///   3. The active dev worktree (= where nelisp-emacs-compat.el currently lives)
-///   4. The canonical clone  (= older snapshot, may be missing recent files)
-///   5. Canonical-clone path returned regardless so first probe surfaces a
-///      clear "file not found" error.
+///   3. Walk a list of well-known dev candidates, preferring those that
+///      contain `nelisp-emacs-compat.el' (= the marker file shipped only
+///      by the active substrate worktree, missing from the older
+///      canonical clone).  Both the direct (`Cowork/Notes/...') and
+///      symlinked (`Notes/...') prefixes are tried so the resolver works
+///      regardless of which prefix the user's process can stat.
+///   4. Canonical fallback.
 pub fn layer2_src_path() -> String {
     if let Ok(home) = std::env::var("NEMACS_HOME") {
         return format!("{}/src", home.trim_end_matches('/'));
@@ -70,9 +73,15 @@ pub fn layer2_src_path() -> String {
     }
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
     let candidates = [
+        // Direct + symlinked worktree paths.
         format!(
             "{home}/Cowork/Notes/dev/nelisp-emacs/.worktrees/emacs-builtins-port/src"
         ),
+        format!(
+            "{home}/Notes/dev/nelisp-emacs/.worktrees/emacs-builtins-port/src"
+        ),
+        // Direct + symlinked canonical clone paths.
+        format!("{home}/Cowork/Notes/dev/nelisp-emacs/src"),
         format!("{home}/Notes/dev/nelisp-emacs/src"),
     ];
     for c in &candidates {
@@ -83,9 +92,9 @@ pub fn layer2_src_path() -> String {
             return c.clone();
         }
     }
-    // Fallback: canonical clone path (= older snapshot path, kept stable
-    // for users who haven't yet checked out the latest substrate).
-    candidates[1].clone()
+    // Fallback: canonical clone (symlink form), kept stable for users who
+    // haven't yet checked out the latest substrate.
+    candidates[3].clone()
 }
 
 /// Resolve the NEMACS_HOME-equivalent root (= parent of `src/').
