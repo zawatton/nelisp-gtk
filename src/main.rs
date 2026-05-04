@@ -3,7 +3,7 @@
 // "Hello, NeLisp" string using Pango defaults.  No NeLisp embedding yet.
 
 use gtk::prelude::*;
-use gtk::{Application, ApplicationWindow, Label};
+use gtk::{glib, Application, ApplicationWindow, Label};
 
 const APP_ID: &str = "org.nelisp.emacs.gtk";
 
