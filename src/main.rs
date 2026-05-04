@@ -1,22 +1,22 @@
-// Phase 1.D.3b — command-loop-routed key dispatch.
+// Phase 1.D.4 — mode-line + echo-area layout.
 //
-// 1.D.2 translated each GTK key into a hard-coded edit primitive
-// (`(insert ...)' / `(delete-backward-char 1)' / `(backward-char 1)' /
-// `(forward-char 1)' / `(newline)').  That bypassed the full Layer 2
-// dispatch path (= keymap lookup → `command-execute' → `call-
-// interactively' → command bookkeeping), which means binding overrides,
-// `pre-command-hook', `post-command-hook', `this-command' /
-// `last-command' state, and `self-insert-command' / `newline' /
-// `delete-backward-char' undo recording all stayed dark.
+// 1.D.3b moved key dispatch onto the substrate command-loop while the
+// surface around the buffer was still scaffolding (= ASCII frame
+// borders + bootstrap-probe rows + a "Last key:" status row).  This
+// phase replaces that with the canonical Emacs three-region layout:
 //
-// This phase wires the GTK key event into
-// `emacs-command-loop-feed-events' + `emacs-command-loop-step', which
-// is the same dispatch entrypoint the TUI driver uses.  At boot time
-// we install a minimal global keymap (printable ASCII →
-// `self-insert-command'; RET → `newline'; Backspace →
-// `delete-backward-char'; arrows → motion).  GTK keysyms translate to
-// either an integer (= the unicode codepoint, for `self-insert')
-// or a quoted symbol like `'backspace' / `'left' / `'return'.
+//   rows 0..MODE_LINE_ROW  → buffer area (= full canvas width)
+//   row  MODE_LINE_ROW     → mode line  (highlighted, inverted text)
+//   row  ECHO_AREA_ROW     → echo area  (= where messages land,
+//                            currently shows the last key event)
+//
+// Mode line content is computed each refresh from `(buffer-name)' /
+// `(line-number-at-pos)' / `(point)' / `(point-max)' / `major-mode'
+// against the *welcome* buffer, padded with dashes to canvas width
+// — the same shape `nemacs-main--initial-paint' renders on the TUI
+// driver, just without the SGR sequences.  GTK provides the window
+// title bar so we drop the top frame border that 1.D.3b carried over
+// from the 1.A scaffolding.
 
 mod grid;
 mod nelisp_bridge;
@@ -37,11 +37,12 @@ const ROWS: usize = 24;
 const COLS: usize = 80;
 const FONT: &str = "Monospace 12";
 
-const STATUS_ROW: usize = ROWS - 2;
-const BUFFER_AREA_START: usize = 12;
-const BUFFER_AREA_END: usize = STATUS_ROW - 1; // exclusive
-const BUFFER_AREA_COL_START: usize = 4;
-const BUFFER_AREA_COL_END: usize = COLS - 2; // exclusive
+const MODE_LINE_ROW: usize = ROWS - 2;
+const ECHO_AREA_ROW: usize = ROWS - 1;
+const BUFFER_AREA_START: usize = 0;
+const BUFFER_AREA_END: usize = MODE_LINE_ROW; // exclusive
+const BUFFER_AREA_COL_START: usize = 0;
+const BUFFER_AREA_COL_END: usize = COLS;
 
 struct AppState {
     grid: CharGrid,
@@ -82,13 +83,38 @@ fn truncate_to(mut s: String, max: usize) -> String {
     s
 }
 
-fn put_probe_row(g: &mut CharGrid, row: usize, label: &str, form: &str, result: &str) {
-    const LABEL_COL: usize = 2;
-    const FORM_COL: usize = 22;
-    const RESULT_COL: usize = 50;
-    g.put_str(row, LABEL_COL, label);
-    g.put_str(row, FORM_COL, form);
-    g.put_str(row, RESULT_COL, &truncate_to(result.to_string(), COLS - RESULT_COL - 1));
+/// Compose a mode-line text matching the canonical Emacs shape:
+///
+///   `-U:--- *welcome*    L<N>    All    (Fundamental)` + dash pad
+///
+/// Buffer name is centred-ish (= follows the prefix); after the line
+/// number / position / mode group the rest of the row is filled with
+/// `-` to canvas width — same trailing-dash convention the TUI
+/// backend prints.  All inputs default to `?` if the substrate query
+/// returned an error.
+fn format_mode_line(
+    name: &str,
+    line: &str,
+    pos: &str,
+    mode: &str,
+    cols: usize,
+) -> String {
+    let body = format!(
+        "-U:---  {name}    L{line}   {pos}   ({mode}) ",
+        name = name,
+        line = line,
+        pos = pos,
+        mode = mode,
+    );
+    let mut s = body;
+    while s.chars().count() < cols {
+        s.push('-');
+    }
+    if s.chars().count() > cols {
+        s.chars().take(cols).collect()
+    } else {
+        s
+    }
 }
 
 fn welcome_buffer_form() -> &'static str {
@@ -100,10 +126,13 @@ fn welcome_buffer_form() -> &'static str {
             (erase-buffer)
             (insert "Welcome to nemacs-gtk!\n")
             (insert "\n")
-            (insert "Phase 1.D.3b: keys route through the substrate\n")
-            (insert "command-loop now (= self-insert / newline /\n")
-            (insert "delete-backward-char / motion via call-interactively).\n")
-            (insert "Try typing, Backspace, Enter, Left/Right.\n")
+            (insert "Phase 1.D.4: real Emacs layout —\n")
+            (insert "  * full-canvas buffer area\n")
+            (insert "  * mode line below (highlighted)\n")
+            (insert "  * echo area at the very bottom\n")
+            (insert "\n")
+            (insert "Type to insert, Backspace / Enter / arrows for\n")
+            (insert "motion + edits.  Mode line refreshes after each key.\n")
             (insert "\n")
             (insert "> "))
           (buffer-name buf)))"#
@@ -138,17 +167,32 @@ fn unquote_printed(s: &str) -> String {
     }
 }
 
-/// Stamp the "Last key:" status line, clearing the row first.
-fn put_status_line(g: &mut CharGrid, last_key: &str) {
-    for c in 2..(COLS - 2) {
-        g.put(STATUS_ROW, c, ' ');
+/// Stamp the echo area (= row `ECHO_AREA_ROW') with `text', clearing
+/// the row first.  Empty text shows a placeholder hint.  Truncates
+/// to canvas width with an ellipsis if needed.
+fn put_echo_area(g: &mut CharGrid, text: &str) {
+    for c in 0..COLS {
+        g.put(ECHO_AREA_ROW, c, ' ');
     }
-    let text = if last_key.is_empty() {
+    let display = if text.is_empty() {
         "(press any key)".to_string()
     } else {
-        format!("Last key: {last_key}")
+        format!("Last key: {text}")
     };
-    g.put_str(STATUS_ROW, 2, &truncate_to(text, COLS - 4));
+    g.put_str(ECHO_AREA_ROW, 0, &truncate_to(display, COLS));
+}
+
+/// Stamp the mode line (= row `MODE_LINE_ROW') with `text', padded /
+/// truncated to canvas width.  Visual highlight (= inverted colours)
+/// is the draw callback's responsibility, not ours.
+fn put_mode_line(g: &mut CharGrid, text: &str) {
+    for c in 0..COLS {
+        g.put(MODE_LINE_ROW, c, ' ');
+    }
+    let chars: Vec<char> = text.chars().take(COLS).collect();
+    for (i, ch) in chars.iter().enumerate() {
+        g.put(MODE_LINE_ROW, i, *ch);
+    }
 }
 
 /// Walk `buffer' counting chars/newlines to the 1-based POINT and
@@ -170,6 +214,44 @@ fn point_to_row_col(buffer: &str, point: usize) -> (usize, usize) {
         }
     }
     (row, col)
+}
+
+/// Re-query the substrate for `*welcome*' state and re-stamp the
+/// mode line on the grid.  Pulls `(buffer-name)' / `(line-number-
+/// at-pos)' / `(point)' / `(point-max)' / `major-mode' (= names that
+/// `emacs-init' bootstraps via `emacs-buffer-builtins' /
+/// `emacs-line-builtins' / `emacs-mode-builtins').  Errors fall back
+/// to "?" so the row never goes blank.
+fn refresh_mode_line(grid: &mut CharGrid, session: &mut Session) {
+    let probe = |form: &str, default: &str, session: &mut Session| -> String {
+        let r = session.eval_to_string(form);
+        if r.starts_with("ERR ") {
+            default.into()
+        } else {
+            r
+        }
+    };
+    let name_raw = probe(
+        r#"(with-current-buffer (get-buffer "*welcome*") (buffer-name))"#,
+        "?",
+        session,
+    );
+    let name = unquote_printed(&name_raw);
+    let line = probe(
+        r#"(with-current-buffer (get-buffer "*welcome*") (line-number-at-pos))"#,
+        "?",
+        session,
+    );
+    let mode_raw = probe("(symbol-name major-mode)", "?", session);
+    let mode = unquote_printed(&mode_raw);
+
+    // Position indicator: "All" when the buffer fits in the visible
+    // area, else a percentage.  Until we add scrolling we always show
+    // the full buffer, so this is just "All".
+    let pos = "All".to_string();
+
+    let line_text = format_mode_line(&name, line.trim(), &pos, &mode, COLS);
+    put_mode_line(grid, &line_text);
 }
 
 /// Re-query `(buffer-string)' + `(point)' for `*welcome*', re-stamp
@@ -235,82 +317,50 @@ fn build_event_literal(
     }
 }
 
-/// Build the static frame, run bootstrap + welcome buffer setup, and
-/// populate the editable buffer area for the first time.  Returns the
+/// Run bootstrap + welcome buffer + keymap install, then populate
+/// the buffer area + mode line for the first paint.  Returns the
 /// fully-initialised state ready for the GTK event loop.
 fn build_initial_state() -> AppState {
     let mut g = CharGrid::blank(ROWS, COLS);
-    let last_row = ROWS - 1;
-    let last_col = COLS - 1;
-
-    g.put(0, 0, '+');
-    g.put(0, last_col, '+');
-    g.put(last_row, 0, '+');
-    g.put(last_row, last_col, '+');
-    for c in 1..last_col {
-        g.put(0, c, '-');
-        g.put(last_row, c, '-');
-    }
-    g.put_str_centered(0, " nemacs-gtk ");
-    g.put_str_centered(last_row, " close X to quit ");
-    g.put_str_centered(1, "Phase 1.D.3b — command-loop-routed dispatch");
-
     let mut session = Session::new();
 
-    g.put_str(3, 2, "Bootstrap");
-    put_probe_row(&mut g, 4, "step", "form", "=>");
-    for c in 2..COLS - 2 {
-        g.put(5, c, '-');
-    }
     let setup_result = session.eval_to_string(&nelisp_bridge::layer2_setup_form());
-    put_probe_row(&mut g, 6, "bootstrap", "(require 'emacs-init)", &setup_result);
     let req_result = session.eval_to_string("(require 'emacs-buffer-builtins)");
-    put_probe_row(
-        &mut g,
-        7,
-        "require buffer",
-        "(require 'emacs-buffer-builtins)",
-        &req_result,
-    );
     let buffer_result = session.eval_to_string(welcome_buffer_form());
     let keymap_result = session.eval_to_string(nelisp_bridge::command_loop_setup_form());
-    let bootstrap_ok = !req_result.starts_with("ERR ")
+    let bootstrap_ok = !setup_result.starts_with("ERR ")
+        && !req_result.starts_with("ERR ")
         && !buffer_result.starts_with("ERR ")
         && !keymap_result.starts_with("ERR ");
-    put_probe_row(
-        &mut g,
-        8,
-        "buffer ready",
-        "(buffer-name buf)",
-        &buffer_result,
-    );
-    put_probe_row(
-        &mut g,
-        9,
-        "keymap ready",
-        "(use-global-map …)",
-        &keymap_result,
-    );
-
-    g.put_str(10, 2, "*welcome* buffer (live, editable):");
-    for c in 2..COLS - 2 {
-        g.put(11, c, '-');
-    }
 
     let cursor = if bootstrap_ok {
-        refresh_buffer_area(&mut g, &mut session)
+        let c = refresh_buffer_area(&mut g, &mut session);
+        refresh_mode_line(&mut g, &mut session);
+        c
     } else {
-        let msg = format!("[bootstrap failed]\n{buffer_result}");
-        for (i, line) in msg.lines().take(BUFFER_AREA_END - BUFFER_AREA_START).enumerate() {
-            g.put_str(BUFFER_AREA_START + i, BUFFER_AREA_COL_START, line);
+        // Bootstrap diagnostic: stamp the failing step into the
+        // top of the buffer area so the user sees what blew up.
+        let diag = [
+            ("layer2 setup", &setup_result),
+            ("(require 'emacs-buffer-builtins)", &req_result),
+            ("welcome buffer", &buffer_result),
+            ("command-loop keymap", &keymap_result),
+        ];
+        let mut row = BUFFER_AREA_START;
+        g.put_str(row, 0, "[bootstrap failed]");
+        row += 2;
+        for (label, result) in diag {
+            if row >= BUFFER_AREA_END {
+                break;
+            }
+            g.put_str(row, 0, &truncate_to(format!("{label}: {result}"), COLS));
+            row += 1;
         }
+        put_mode_line(&mut g, &format_mode_line("?", "?", "?", "?", COLS));
         None
     };
 
-    for c in 2..COLS - 2 {
-        g.put(STATUS_ROW - 1, c, '-');
-    }
-    put_status_line(&mut g, "");
+    put_echo_area(&mut g, "");
 
     AppState {
         grid: g,
@@ -342,10 +392,18 @@ fn build_ui(app: &Application) {
         layout.set_font_description(Some(&desc));
 
         let st = state_for_draw.borrow();
+        let canvas_w = cell_w * COLS as f64;
 
-        // Phase 1.D.3a — block cursor at point.  Painted BEFORE the
-        // glyphs so the char rendered into that cell stays visible (=
-        // semi-transparent fill darkens but doesn't occlude).
+        // Mode line background — paint a dark bar across row
+        // MODE_LINE_ROW first so glyphs land on top in inverted colour.
+        cr.set_source_rgb(0.18, 0.18, 0.22);
+        cr.rectangle(0.0, MODE_LINE_ROW as f64 * cell_h, canvas_w, cell_h);
+        let _ = cr.fill();
+
+        // Phase 1.D.3a — block cursor at point.  Painted AFTER the
+        // mode-line bar but BEFORE the buffer glyphs so the char in
+        // the highlighted cell stays visible (= semi-transparent fill
+        // darkens but doesn't occlude).
         if let Some((row, col)) = st.cursor {
             cr.set_source_rgba(0.2, 0.4, 0.9, 0.45);
             cr.rectangle(
@@ -357,9 +415,14 @@ fn build_ui(app: &Application) {
             let _ = cr.fill();
         }
 
-        cr.set_source_rgb(0.0, 0.0, 0.0);
         let mut buf = [0u8; 4];
         for row in 0..st.grid.rows {
+            // Mode-line text uses inverted colour against the dark bar.
+            if row == MODE_LINE_ROW {
+                cr.set_source_rgb(0.94, 0.94, 0.94);
+            } else {
+                cr.set_source_rgb(0.0, 0.0, 0.0);
+            }
             for col in 0..st.grid.cols {
                 let ch = st.grid.get(row, col);
                 if ch == ' ' {
@@ -402,10 +465,11 @@ fn build_ui(app: &Application) {
                     nelisp_bridge::command_loop_dispatch_form("*welcome*", &literal);
                 let _ = app.session.eval_to_string(&form);
                 app.cursor = refresh_buffer_area(&mut app.grid, &mut app.session);
+                refresh_mode_line(&mut app.grid, &mut app.session);
             }
         }
         app.last_key = repr.clone();
-        put_status_line(&mut app.grid, &repr);
+        put_echo_area(&mut app.grid, &repr);
         drop(st);
         area_for_key.queue_draw();
         glib::Propagation::Proceed
@@ -451,21 +515,63 @@ mod tests {
     }
 
     #[test]
-    fn put_status_line_clears_previous_text() {
+    fn put_echo_area_clears_previous_text() {
         let mut g = CharGrid::blank(ROWS, COLS);
-        put_status_line(&mut g, "very-long-keysym-name");
-        put_status_line(&mut g, "a");
-        let row: String = (0..COLS).map(|c| g.get(STATUS_ROW, c)).collect();
+        put_echo_area(&mut g, "very-long-keysym-name");
+        put_echo_area(&mut g, "a");
+        let row: String = (0..COLS).map(|c| g.get(ECHO_AREA_ROW, c)).collect();
         assert!(row.contains("Last key: a"));
         assert!(!row.contains("very-long"));
     }
 
     #[test]
-    fn put_status_line_initial_empty_shows_prompt() {
+    fn put_echo_area_initial_empty_shows_prompt() {
         let mut g = CharGrid::blank(ROWS, COLS);
-        put_status_line(&mut g, "");
-        let row: String = (0..COLS).map(|c| g.get(STATUS_ROW, c)).collect();
+        put_echo_area(&mut g, "");
+        let row: String = (0..COLS).map(|c| g.get(ECHO_AREA_ROW, c)).collect();
         assert!(row.contains("(press any key)"));
+    }
+
+    #[test]
+    fn format_mode_line_pads_with_dashes_and_truncates() {
+        let line = format_mode_line("*welcome*", "1", "All", "Fundamental", 80);
+        assert_eq!(line.chars().count(), 80);
+        assert!(line.contains("*welcome*"));
+        assert!(line.contains("L1"));
+        assert!(line.contains("All"));
+        assert!(line.contains("(Fundamental)"));
+        assert!(line.ends_with('-'));
+
+        let narrow = format_mode_line("xxxxxxxxxxxxxxxxxxxx", "1", "All", "Fund", 10);
+        assert_eq!(narrow.chars().count(), 10);
+    }
+
+    #[test]
+    fn put_mode_line_overwrites_full_row() {
+        let mut g = CharGrid::blank(ROWS, COLS);
+        put_mode_line(&mut g, "AAAA");
+        let r: String = (0..COLS).map(|c| g.get(MODE_LINE_ROW, c)).collect();
+        assert!(r.starts_with("AAAA"));
+        // Cells past the input remain blank (= we cleared the row).
+        assert_eq!(g.get(MODE_LINE_ROW, 5), ' ');
+        // Re-stamp shorter content does not leak old chars.
+        put_mode_line(&mut g, "B");
+        let r2: String = (0..COLS).map(|c| g.get(MODE_LINE_ROW, c)).collect();
+        assert!(r2.starts_with("B"));
+        assert!(!r2.contains("AAAA"));
+    }
+
+    #[test]
+    fn refresh_mode_line_writes_buffer_name() {
+        let mut s = Session::new();
+        let setup = s.eval_to_string(&nelisp_bridge::layer2_setup_form());
+        assert!(!setup.starts_with("ERR "), "setup failed: {setup}");
+        let _ = s.eval_to_string(welcome_buffer_form());
+        let mut g = CharGrid::blank(ROWS, COLS);
+        refresh_mode_line(&mut g, &mut s);
+        let row: String = (0..COLS).map(|c| g.get(MODE_LINE_ROW, c)).collect();
+        assert!(row.contains("*welcome*"), "row = {row:?}");
+        assert!(row.contains("L1"), "row = {row:?}");
     }
 
     #[test]

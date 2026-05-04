@@ -34,12 +34,6 @@ impl CharGrid {
         }
     }
 
-    pub fn put_str_centered(&mut self, row: usize, s: &str) {
-        let len = s.chars().count();
-        let start = self.cols.saturating_sub(len) / 2;
-        self.put_str(row, start, s);
-    }
-
     pub fn get(&self, row: usize, col: usize) -> char {
         self.cells[row * self.cols + col]
     }
