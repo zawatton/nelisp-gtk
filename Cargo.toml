@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 gtk = { package = "gtk4", version = "0.9" }
 pangocairo = "0.20"
+nelisp = { package = "nelisp-build-tool", path = "../nelisp/build-tool" }
 
 [profile.release]
 opt-level = 3

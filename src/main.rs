@@ -1,22 +1,19 @@
-// Phase 1.B — Pango monospace character grid (80 cols x 24 rows).
+// Phase 1.C.1 — embed NeLisp runtime + render eval results in the grid.
 //
-// This step replaces the placeholder Label with a DrawingArea that
-// renders a fixed test pattern via Pango/Cairo at canonical character-cell
-// positions, mirroring how `emacs-tui-backend' lays glyphs onto the
-// terminal grid.  A future Phase 1.C will replace the static pattern
-// with a logical-buffer redraw driven by the embedded NeLisp runtime.
+// Builds on Phase 1.B's Pango monospace grid by replacing the static
+// diagonal-and-dots pattern with a precomputed `CharGrid' that holds
+// the textual readout of a few NeLisp eval probes — proving the
+// embedded interpreter is alive and reachable from the GTK main thread.
 //
-// Test pattern (= visually verifiable Phase 1.B close gate):
-//   - Row 0: header label
-//   - Row 1: column ruler (0123456789 repeating)
-//   - Rows 2..22: light dot fill ('.') everywhere except a diagonal '*'
-//                 from top-left to bottom-right of the inner area
-//   - Row 23: footer label
-//   - Corner markers '+' at the four extreme cells
-//
-// Cell dimensions are measured once from Pango metrics for the chosen
-// monospace font; the window opens at exactly the grid's pixel extent.
+// Phase 1.C.2 will add load-path + `(require '...)' so we can pull in
+// Layer 2 elisp from `nelisp-emacs/src/'.  Phase 1.C.3 will replace the
+// startup-only fill with a redraw triggered after each command-loop
+// step, mirroring how the TUI driver repaints the terminal grid.
 
+mod grid;
+mod nelisp_bridge;
+
+use grid::CharGrid;
 use gtk::pango;
 use gtk::pango::FontDescription;
 use gtk::prelude::*;
@@ -33,8 +30,7 @@ fn main() -> glib::ExitCode {
     app.run()
 }
 
-/// Measure the average advance width and total line height of the
-/// chosen monospace font, returning (cell_w, cell_h, ascent) in pixels.
+/// Measure (cell_w, cell_h, ascent) in pixels for the chosen monospace font.
 fn measure_cell() -> (f64, f64, f64) {
     let fontmap = pangocairo::FontMap::default();
     let ctx = fontmap.create_context();
@@ -47,57 +43,68 @@ fn measure_cell() -> (f64, f64, f64) {
     (cell_w, ascent + descent, ascent)
 }
 
-/// Build the test pattern character for a given (row, col).
-fn pattern_char(row: usize, col: usize) -> char {
+/// Build the static welcome grid for Phase 1.C.1 — header, NeLisp probe
+/// results, footer.  Visible proof that `nelisp::eval::eval_str' is wired
+/// up and produces correct values from inside the GTK process.
+fn build_welcome_grid() -> CharGrid {
+    let mut g = CharGrid::blank(ROWS, COLS);
+
+    // Border decoration (corner markers + thin top/bottom lines).
     let last_row = ROWS - 1;
     let last_col = COLS - 1;
-    let inner_top = 2;
-    let inner_bot = last_row - 1;
-
-    // Corner markers
-    if (row == 0 || row == last_row) && (col == 0 || col == last_col) {
-        return '+';
+    g.put(0, 0, '+');
+    g.put(0, last_col, '+');
+    g.put(last_row, 0, '+');
+    g.put(last_row, last_col, '+');
+    for c in 1..last_col {
+        g.put(0, c, '-');
+        g.put(last_row, c, '-');
     }
 
-    // Header
-    if row == 0 {
-        let text = " Phase 1.B  Pango monospace char grid  80x24 ";
-        let start = (COLS.saturating_sub(text.len())) / 2;
-        let bytes = text.as_bytes();
-        if col >= start && col < start + bytes.len() {
-            return bytes[col - start] as char;
+    // Headers
+    g.put_str_centered(0, " nemacs-gtk ");
+    g.put_str_centered(2, "Phase 1.C.1 — embedded NeLisp runtime sanity check");
+
+    // Probe lines.  Each row shows form + result (or ERR ...).
+    let probes: &[(&str, &str)] = &[
+        ("integer arithmetic", "(+ 1 2)"),
+        ("multiplication",     "(* 7 8)"),
+        ("string concat",      "(concat \"hello, \" \"world\")"),
+        ("list length",        "(length '(a b c d e))"),
+        ("nested call",        "(+ (* 3 4) (* 5 6))"),
+        ("cons + car/cdr",     "(car (cdr '(a b c)))"),
+    ];
+    let label_col = 2usize;
+    let form_col = 22usize;
+    let result_col = 50usize;
+    g.put_str(4, label_col, "label");
+    g.put_str(4, form_col, "form");
+    g.put_str(4, result_col, "=>");
+    for c in 0..(COLS - 4) {
+        g.put(5, c + 2, '-');
+    }
+    for (i, (label, form)) in probes.iter().enumerate() {
+        let row = 6 + i;
+        g.put_str(row, label_col, label);
+        g.put_str(row, form_col, form);
+        let mut result = nelisp_bridge::eval_to_string(form);
+        // Truncate so the result column never overflows the grid.
+        let max_result_len = COLS - result_col - 1;
+        if result.chars().count() > max_result_len {
+            result.truncate(max_result_len);
+            result.push('…');
         }
-        return '-';
-    }
-
-    // Column ruler
-    if row == 1 {
-        return char::from_digit((col % 10) as u32, 10).unwrap_or(' ');
+        g.put_str(row, result_col, &result);
     }
 
     // Footer
-    if row == last_row {
-        let text = " close X to quit ";
-        let start = (COLS.saturating_sub(text.len())) / 2;
-        let bytes = text.as_bytes();
-        if col >= start && col < start + bytes.len() {
-            return bytes[col - start] as char;
-        }
-        return '-';
-    }
+    g.put_str_centered(
+        last_row - 2,
+        "All probes evaluated by the embedded NeLisp runtime",
+    );
+    g.put_str_centered(last_row, " close X to quit ");
 
-    // Inner area: '*' on the rough diagonal, '.' elsewhere.
-    if row >= inner_top && row <= inner_bot {
-        let inner_rows = inner_bot - inner_top + 1;
-        let inner_cols = last_col + 1;
-        let r = row - inner_top;
-        let diag_col = (r * inner_cols) / inner_rows;
-        if col == diag_col {
-            return '*';
-        }
-        return '.';
-    }
-    ' '
+    g
 }
 
 fn build_ui(app: &Application) {
@@ -105,38 +112,36 @@ fn build_ui(app: &Application) {
     let canvas_w = (cell_w * COLS as f64).ceil() as i32;
     let canvas_h = (cell_h * ROWS as f64).ceil() as i32;
 
+    // Compute the grid once at startup.  Future phases will refresh on
+    // every command-loop step and queue_draw().
+    let g = build_welcome_grid();
+
     let area = DrawingArea::new();
     area.set_content_width(canvas_w);
     area.set_content_height(canvas_h);
 
     area.set_draw_func(move |_area, cr, _w, _h| {
-        // Background — pure white for the MVP, will become face-driven.
         cr.set_source_rgb(1.0, 1.0, 1.0);
         let _ = cr.paint();
-
         cr.set_source_rgb(0.0, 0.0, 0.0);
+
         let layout = pangocairo::functions::create_layout(cr);
         let desc = FontDescription::from_string(FONT);
         layout.set_font_description(Some(&desc));
 
         let mut buf = [0u8; 4];
-        for row in 0..ROWS {
-            for col in 0..COLS {
-                let ch = pattern_char(row, col);
+        for row in 0..g.rows {
+            for col in 0..g.cols {
+                let ch = g.get(row, col);
                 if ch == ' ' {
                     continue;
                 }
                 layout.set_text(ch.encode_utf8(&mut buf));
-                let x = col as f64 * cell_w;
-                // Pango layouts draw from the top of the line; align the
-                // glyph baseline to (row * cell_h + ascent) by moving to
-                // the top of the cell row.
-                let y = row as f64 * cell_h;
-                cr.move_to(x, y);
+                cr.move_to(col as f64 * cell_w, row as f64 * cell_h);
                 pangocairo::functions::show_layout(cr, &layout);
             }
         }
-        let _ = ascent; // reserved for baseline-precise rendering in 1.C
+        let _ = ascent; // reserved for baseline-precise rendering in 1.C.3
     });
 
     let window = ApplicationWindow::builder()

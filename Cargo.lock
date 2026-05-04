@@ -417,10 +417,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "nelisp-build-tool"
+version = "0.5.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "nelisp-emacs-gtk"
 version = "0.1.0"
 dependencies = [
  "gtk4",
+ "nelisp-build-tool",
  "pangocairo",
 ]
 
