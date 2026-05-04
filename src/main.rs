@@ -41,6 +41,11 @@ struct AppState {
     session: Session,
     last_key: String,
     bootstrap_ok: bool,
+    /// Screen-relative (row, col) of the buffer's `(point)` in the
+    /// `*welcome*' buffer, recomputed after every key dispatch.  None
+    /// when bootstrap failed or `(point)` lies outside the visible
+    /// buffer-mirror window.
+    cursor: Option<(usize, usize)>,
 }
 
 fn main() -> glib::ExitCode {
@@ -139,11 +144,35 @@ fn put_status_line(g: &mut CharGrid, last_key: &str) {
     g.put_str(STATUS_ROW, 2, &truncate_to(text, COLS - 4));
 }
 
-/// Re-query `(buffer-string)` for `*welcome*' and re-stamp the result
-/// into the grid's editable buffer area.  Called once at startup and
-/// after every key dispatch.
-fn refresh_buffer_area(grid: &mut CharGrid, session: &mut Session) {
-    let text = session.eval_to_string(r#"(with-current-buffer (get-buffer "*welcome*") (buffer-string))"#);
+/// Walk `buffer' counting chars/newlines to the 1-based POINT and
+/// return the resulting (row, col) — both 0-based, relative to the
+/// start of the buffer text (= NOT screen coordinates).
+fn point_to_row_col(buffer: &str, point: usize) -> (usize, usize) {
+    let target = point.saturating_sub(1);
+    let mut row = 0usize;
+    let mut col = 0usize;
+    for (i, ch) in buffer.chars().enumerate() {
+        if i == target {
+            break;
+        }
+        if ch == '\n' {
+            row += 1;
+            col = 0;
+        } else {
+            col += 1;
+        }
+    }
+    (row, col)
+}
+
+/// Re-query `(buffer-string)' + `(point)' for `*welcome*', re-stamp
+/// the buffer text into the grid's editable region, and return the
+/// screen-relative cursor position derived from the new point.
+/// Called once at startup and after every key dispatch.
+fn refresh_buffer_area(grid: &mut CharGrid, session: &mut Session) -> Option<(usize, usize)> {
+    let text = session.eval_to_string(
+        r#"(with-current-buffer (get-buffer "*welcome*") (buffer-string))"#,
+    );
     let content = unquote_printed(&text);
     for row in BUFFER_AREA_START..BUFFER_AREA_END {
         for col in BUFFER_AREA_COL_START..BUFFER_AREA_COL_END {
@@ -155,6 +184,17 @@ fn refresh_buffer_area(grid: &mut CharGrid, session: &mut Session) {
     for (i, line) in content.lines().take(max_rows).enumerate() {
         let truncated: String = line.chars().take(max_cols).collect();
         grid.put_str(BUFFER_AREA_START + i, BUFFER_AREA_COL_START, &truncated);
+    }
+
+    // Cursor: derive from elisp `(point)' against the same buffer text.
+    let point_str = session
+        .eval_to_string(r#"(with-current-buffer (get-buffer "*welcome*") (point))"#);
+    let point: usize = point_str.trim().parse().ok()?;
+    let (br, bc) = point_to_row_col(&content, point);
+    if br < max_rows && bc <= max_cols {
+        Some((BUFFER_AREA_START + br, BUFFER_AREA_COL_START + bc))
+    } else {
+        None
     }
 }
 
@@ -244,14 +284,15 @@ fn build_initial_state() -> AppState {
         g.put(11, c, '-');
     }
 
-    if bootstrap_ok {
-        refresh_buffer_area(&mut g, &mut session);
+    let cursor = if bootstrap_ok {
+        refresh_buffer_area(&mut g, &mut session)
     } else {
         let msg = format!("[bootstrap failed]\n{buffer_result}");
         for (i, line) in msg.lines().take(BUFFER_AREA_END - BUFFER_AREA_START).enumerate() {
             g.put_str(BUFFER_AREA_START + i, BUFFER_AREA_COL_START, line);
         }
-    }
+        None
+    };
 
     for c in 2..COLS - 2 {
         g.put(STATUS_ROW - 1, c, '-');
@@ -263,6 +304,7 @@ fn build_initial_state() -> AppState {
         session,
         last_key: String::new(),
         bootstrap_ok,
+        cursor,
     }
 }
 
@@ -281,13 +323,28 @@ fn build_ui(app: &Application) {
     area.set_draw_func(move |_area, cr, _w, _h| {
         cr.set_source_rgb(1.0, 1.0, 1.0);
         let _ = cr.paint();
-        cr.set_source_rgb(0.0, 0.0, 0.0);
 
         let layout = pangocairo::functions::create_layout(cr);
         let desc = FontDescription::from_string(FONT);
         layout.set_font_description(Some(&desc));
 
         let st = state_for_draw.borrow();
+
+        // Phase 1.D.3a — block cursor at point.  Painted BEFORE the
+        // glyphs so the char rendered into that cell stays visible (=
+        // semi-transparent fill darkens but doesn't occlude).
+        if let Some((row, col)) = st.cursor {
+            cr.set_source_rgba(0.2, 0.4, 0.9, 0.45);
+            cr.rectangle(
+                col as f64 * cell_w,
+                row as f64 * cell_h,
+                cell_w,
+                cell_h,
+            );
+            let _ = cr.fill();
+        }
+
+        cr.set_source_rgb(0.0, 0.0, 0.0);
         let mut buf = [0u8; 4];
         for row in 0..st.grid.rows {
             for col in 0..st.grid.cols {
@@ -330,7 +387,7 @@ fn build_ui(app: &Application) {
             let form = build_dispatch_form(keyval, modifier);
             if !form.is_empty() {
                 let _ = app.session.eval_to_string(&form);
-                refresh_buffer_area(&mut app.grid, &mut app.session);
+                app.cursor = refresh_buffer_area(&mut app.grid, &mut app.session);
             }
         }
         app.last_key = repr.clone();
@@ -395,6 +452,18 @@ mod tests {
         put_status_line(&mut g, "");
         let row: String = (0..COLS).map(|c| g.get(STATUS_ROW, c)).collect();
         assert!(row.contains("(press any key)"));
+    }
+
+    #[test]
+    fn point_to_row_col_handles_simple_buffer() {
+        // "abc\nxy" with point=1 should give (0, 0).
+        assert_eq!(point_to_row_col("abc\nxy", 1), (0, 0));
+        // point=4 (= the '\n') should still report end of first line.
+        assert_eq!(point_to_row_col("abc\nxy", 4), (0, 3));
+        // point=5 (= 'x') should give (1, 0).
+        assert_eq!(point_to_row_col("abc\nxy", 5), (1, 0));
+        // point=7 (= one past 'y') should give (1, 2).
+        assert_eq!(point_to_row_col("abc\nxy", 7), (1, 2));
     }
 
     #[test]
