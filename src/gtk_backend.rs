@@ -404,20 +404,40 @@ pub fn register_all(env: &mut Env, state: Rc<RefCell<GtkState>>) {
                 Some(s) if s.is_string() => s.as_string_owned().unwrap_or_default(),
                 _ => "Open File".to_string(),
             };
-            let parent = {
-                let g = st.borrow();
-                if !g.initialized {
-                    return Err(EvalError::Internal(
-                        "nelisp-gtk-show-open-dialog: window not initialised — \
-                         call `(nelisp-gtk-init ROWS COLS)' first"
-                            .into(),
-                    ));
-                }
-                g.window.clone()
-            };
-            Ok(show_open_dialog_sync(&title, parent.as_ref())
+            let parent = require_initialised_window(&st, "nelisp-gtk-show-open-dialog")?;
+            Ok(show_file_dialog_sync(&title, parent.as_ref(), FileDialogMode::Open, None)
                 .map(|p| Sexp::Str(p.to_string_lossy().to_string()))
                 .unwrap_or(Sexp::Nil))
+        });
+    }
+
+    // ----- nelisp-gtk-show-save-dialog &optional TITLE INITIAL-NAME -> PATH | nil -----
+    //
+    // Save-As variant of the open dialog.  INITIAL-NAME (when an
+    // elisp string) seeds the dialog's filename field — handy for
+    // suggesting `(buffer-name)' or the current buffer's existing
+    // filename without forcing the user to retype.  Returns the
+    // chosen path or nil on cancel.
+    {
+        let st = state.clone();
+        env.register_extern_builtin("nelisp-gtk-show-save-dialog", move |args, _env| {
+            let title = match args.get(0) {
+                Some(s) if s.is_string() => s.as_string_owned().unwrap_or_default(),
+                _ => "Save File".to_string(),
+            };
+            let initial_name: Option<String> = match args.get(1) {
+                Some(s) if s.is_string() => s.as_string_owned(),
+                _ => None,
+            };
+            let parent = require_initialised_window(&st, "nelisp-gtk-show-save-dialog")?;
+            Ok(show_file_dialog_sync(
+                &title,
+                parent.as_ref(),
+                FileDialogMode::Save,
+                initial_name.as_deref(),
+            )
+            .map(|p| Sexp::Str(p.to_string_lossy().to_string()))
+            .unwrap_or(Sexp::Nil))
         });
     }
 
@@ -470,32 +490,64 @@ fn clipboard_for(
     Ok(display.clipboard())
 }
 
-/// Synchronously show a GTK4 `FileDialog' open prompt rooted at
-/// `parent'.  Returns the selected path or None on cancel / error.
+#[derive(Clone, Copy)]
+enum FileDialogMode {
+    Open,
+    Save,
+}
+
+/// Shared "window must be up" gate — extracts the application
+/// window for a builtin that needs a parent + initialised state.
+/// `name' goes into the error message so callers don't have to.
+fn require_initialised_window(
+    state: &Rc<RefCell<GtkState>>,
+    name: &str,
+) -> Result<Option<ApplicationWindow>, EvalError> {
+    let g = state.borrow();
+    if !g.initialized {
+        return Err(EvalError::Internal(format!(
+            "{name}: window not initialised — \
+             call `(nelisp-gtk-init ROWS COLS)' first"
+        )));
+    }
+    Ok(g.window.clone())
+}
+
+/// Synchronously show a GTK4 `FileDialog' (open or save mode) rooted
+/// at `parent'.  Returns the selected path or None on cancel / error.
 /// Spins the default `MainContext' until the async callback fills
 /// the result cell — no timeout because the dialog is modal and
 /// user-driven.
-fn show_open_dialog_sync(
+fn show_file_dialog_sync(
     title: &str,
     parent: Option<&ApplicationWindow>,
+    mode: FileDialogMode,
+    initial_name: Option<&str>,
 ) -> Option<PathBuf> {
     let dialog = gtk::FileDialog::new();
     dialog.set_title(title);
     dialog.set_modal(true);
+    if let Some(name) = initial_name {
+        dialog.set_initial_name(Some(name));
+    }
 
     let result: Rc<RefCell<Option<Option<PathBuf>>>> = Rc::new(RefCell::new(None));
     let result_cb = result.clone();
-    dialog.open(
-        parent,
-        None::<&gtk::gio::Cancellable>,
-        move |res| {
-            let path = match res {
-                Ok(file) => file.path(),
-                Err(_) => None,
-            };
-            *result_cb.borrow_mut() = Some(path);
-        },
-    );
+    let cb = move |res: Result<gtk::gio::File, glib::Error>| {
+        let path = match res {
+            Ok(file) => file.path(),
+            Err(_) => None,
+        };
+        *result_cb.borrow_mut() = Some(path);
+    };
+    match mode {
+        FileDialogMode::Open => {
+            dialog.open(parent, None::<&gtk::gio::Cancellable>, cb);
+        }
+        FileDialogMode::Save => {
+            dialog.save(parent, None::<&gtk::gio::Cancellable>, cb);
+        }
+    }
 
     let ctx = glib::MainContext::default();
     loop {
