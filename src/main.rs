@@ -26,15 +26,16 @@ use nelisp_bridge::Session;
 
 fn main() {
     let mut session = Session::new();
+    let src = nelisp_bridge::layer2_setup_form();
+    eprintln!(
+        "[nemacs-gtk] layer2_src_path = {}",
+        nelisp_bridge::layer2_src_path()
+    );
 
     // 1. Layer 2 substrate.
-    let r = session.eval_to_string(&nelisp_bridge::layer2_setup_form());
+    let r = session.eval_to_string(&src);
+    eprintln!("[nemacs-gtk] layer2 setup = {r}");
     if r.starts_with("ERR ") {
-        eprintln!("[nemacs-gtk] layer2 boot failed: {r}");
-        eprintln!(
-            "[nemacs-gtk] layer2_src_path = {}",
-            nelisp_bridge::layer2_src_path()
-        );
         std::process::exit(1);
     }
 
@@ -44,29 +45,44 @@ fn main() {
                 (setq initial-window-system 'gtk)
                 'gtk)",
     );
+    eprintln!("[nemacs-gtk] display setup = {r}");
     if r.starts_with("ERR ") {
-        eprintln!("[nemacs-gtk] display-system flip failed: {r}");
         std::process::exit(1);
     }
 
     // 3. GTK builtins.
     let state = Rc::new(RefCell::new(GtkState::new()));
     gtk_backend::register_all(session.env_mut(), state.clone());
+    eprintln!("[nemacs-gtk] register_all done");
 
-    // 4. Hand off to the elisp frontend.
-    let r = session.eval_to_string("(require 'nemacs-gtk-frontend)");
-    if r.starts_with("ERR ") {
-        eprintln!("[nemacs-gtk] frontend require failed: {r}");
-        eprintln!(
-            "[nemacs-gtk] (expected substrate file: {}/nemacs-gtk-frontend.el)",
+    // 4. Frontend file diagnostics (= pin the load-path / file existence
+    // so a "Cannot open load file" failure surfaces ground truth).
+    let frontend_path = format!(
+        "{}/nemacs-gtk-frontend.el",
+        nelisp_bridge::layer2_src_path()
+    );
+    eprintln!(
+        "[nemacs-gtk] frontend file exists on disk = {}",
+        std::path::Path::new(&frontend_path).is_file()
+    );
+    eprintln!(
+        "[nemacs-gtk] (member layer2_src_path load-path) = {}",
+        session.eval_to_string(&format!(
+            "(if (member \"{}\" load-path) t nil)",
             nelisp_bridge::layer2_src_path()
-        );
+        ))
+    );
+
+    // 5. Hand off to the elisp frontend.
+    let r = session.eval_to_string("(require 'nemacs-gtk-frontend)");
+    eprintln!("[nemacs-gtk] require frontend = {r}");
+    if r.starts_with("ERR ") {
         std::process::exit(1);
     }
 
     let r = session.eval_to_string("(nemacs-gtk-main)");
+    eprintln!("[nemacs-gtk] main loop result = {r}");
     if r.starts_with("ERR ") {
-        eprintln!("[nemacs-gtk] main loop exited with error: {r}");
         std::process::exit(1);
     }
 }

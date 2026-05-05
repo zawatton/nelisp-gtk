@@ -146,6 +146,40 @@ mod tests {
     }
 
     #[test]
+    fn frontend_require_resolves() {
+        // Reproduces the EXACT main.rs boot path: layer 2 → display
+        // flip → register builtins → require frontend.  Pinning this
+        // catches the user-reported "Cannot open load file
+        // nemacs-gtk-frontend" + any future regression where a step
+        // disrupts load-path.
+        let mut s = Session::new();
+        let setup = s.eval_to_string(&layer2_setup_form());
+        assert!(!setup.starts_with("ERR "), "layer2 setup failed: {setup}");
+        let flip = s.eval_to_string(
+            "(progn (setq emacs-display-system 'gtk)
+                    (setq initial-window-system 'gtk)
+                    'gtk)",
+        );
+        assert!(!flip.starts_with("ERR "), "display flip failed: {flip}");
+        // Mimic gtk_backend::register_all (= adds extern builtins
+        // which mutate env's globals).  We don't pull in the GTK
+        // backend module here (= it would force GTK link), so just
+        // register a no-op closure that touches the same Env path.
+        s.env_mut().register_extern_builtin(
+            "nelisp-gtk-test-noop",
+            |_, _| Ok(Sexp::Nil),
+        );
+        eprintln!("layer2_src_path = {}", layer2_src_path());
+        eprintln!("load-path car = {}", s.eval_to_string("(car load-path)"));
+        let r = s.eval_to_string("(require 'nemacs-gtk-frontend)");
+        eprintln!("require result = {r}");
+        assert!(
+            !r.starts_with("ERR "),
+            "frontend require failed: {r}"
+        );
+    }
+
+    #[test]
     fn env_mut_allows_extern_builtin_registration() {
         let mut s = Session::new();
         s.env_mut()
