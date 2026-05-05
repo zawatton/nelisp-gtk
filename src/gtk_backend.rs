@@ -15,6 +15,7 @@ use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::rc::Rc;
 
+use gtk::gdk;
 use gtk::glib;
 use gtk::glib::translate::IntoGlib;
 use gtk::pango::{self, FontDescription};
@@ -369,6 +370,119 @@ pub fn register_all(env: &mut Env, state: Rc<RefCell<GtkState>>) {
             },
         );
     }
+
+    // ----- nelisp-gtk-clipboard-set TEXT -----
+    //
+    // Push TEXT (= elisp string) onto the GDK display's primary clipboard.
+    // No-op + returns nil for empty TEXT.  Returns t on success.
+    {
+        let st = state.clone();
+        env.register_extern_builtin("nelisp-gtk-clipboard-set", move |args, _env| {
+            let text = want_string(args, 0, "nelisp-gtk-clipboard-set")?;
+            if text.is_empty() {
+                return Ok(Sexp::Nil);
+            }
+            let clip = clipboard_for(&st)?;
+            clip.set_text(&text);
+            Ok(Sexp::T)
+        });
+    }
+
+    // ----- nelisp-gtk-clipboard-get () -> STRING | nil -----
+    //
+    // Synchronously fetch the current clipboard text via GDK's async
+    // `read_text_async' API by spinning the GLib MainContext until the
+    // callback fires (or a 500 ms timeout — clipboard reads can hang
+    // when the source app is unresponsive; we'd rather return nil than
+    // freeze the UI).
+    {
+        let st = state.clone();
+        env.register_extern_builtin("nelisp-gtk-clipboard-get", move |_args, _env| {
+            let clip = clipboard_for(&st)?;
+            Ok(read_clipboard_text_sync(&clip)
+                .map(Sexp::Str)
+                .unwrap_or(Sexp::Nil))
+        });
+    }
+}
+
+/// Resolve the GDK clipboard for the current display.  Prefers the
+/// app's own ApplicationWindow display when available; falls back to
+/// the default GDK display otherwise (= covers boot-time queries
+/// before the window is built, though that path shouldn't normally
+/// fire because callers gate on `(nelisp-gtk-init)' having run).
+fn clipboard_for(
+    state: &Rc<RefCell<GtkState>>,
+) -> Result<gdk::Clipboard, EvalError> {
+    let g = state.borrow();
+    if !g.initialized {
+        return Err(EvalError::Internal(
+            "nelisp-gtk-clipboard-*: window not initialised — \
+             call `(nelisp-gtk-init ROWS COLS)' first"
+                .into(),
+        ));
+    }
+    let display = if let Some(w) = g.window.as_ref() {
+        WidgetExt::display(w)
+    } else {
+        match gdk::Display::default() {
+            Some(d) => d,
+            None => {
+                return Err(EvalError::Internal(
+                    "nelisp-gtk-clipboard-*: no GDK display available".into(),
+                ));
+            }
+        }
+    };
+    Ok(display.clipboard())
+}
+
+/// Synchronously read text off `clipboard'.  Bridges GTK4's async-only
+/// API by:
+///   1. Kick off `read_text_async' with a callback that drops the
+///      result into a shared cell.
+///   2. Schedule a 500 ms timeout that flips a "give up" flag.
+///   3. Spin `MainContext::iteration(true)' until either the cell or
+///      the flag fills — `iteration(true)' blocks until at least one
+///      source dispatches, so this is a busy-wait without burning CPU.
+///
+/// Single-threaded — borrows on the shared `Rc<RefCell<...>>' never
+/// overlap because the iteration call dispatches the callback inline.
+fn read_clipboard_text_sync(clipboard: &gdk::Clipboard) -> Option<String> {
+    let result: Rc<RefCell<Option<Option<String>>>> = Rc::new(RefCell::new(None));
+    let result_cb = result.clone();
+    clipboard.read_text_async(
+        None::<&gtk::gio::Cancellable>,
+        move |res| {
+            let s = match res {
+                Ok(Some(g)) => Some(g.to_string()),
+                _ => None,
+            };
+            *result_cb.borrow_mut() = Some(s);
+        },
+    );
+
+    let timed_out = Rc::new(RefCell::new(false));
+    let timed_out_cb = timed_out.clone();
+    glib::timeout_add_local_once(
+        std::time::Duration::from_millis(500),
+        move || {
+            *timed_out_cb.borrow_mut() = true;
+        },
+    );
+
+    let ctx = glib::MainContext::default();
+    loop {
+        if result.borrow().is_some() {
+            break;
+        }
+        if *timed_out.borrow() {
+            break;
+        }
+        ctx.iteration(true);
+    }
+    let out = result.borrow().clone().flatten();
+    out
 }
 
 /// Walk a `Sexp' menu SPEC and install it as the application's
