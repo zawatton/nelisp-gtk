@@ -380,6 +380,54 @@ mod tests {
         assert_eq!(s.eval_to_string("initial-window-system"), "gtk");
     }
 
+    /// Diagnostic — reproduces the user-reported "(window-system) =>
+    /// unbound, (display-graphic-p) => nil" pattern.  After
+    /// `layer2_setup_form` (= `(require 'emacs-init)` chain) the
+    /// substrate's `emacs-stub.el' should have defaliased
+    /// `window-system' / `display-graphic-p' onto our
+    /// `emacs-display-*' helpers; if the fboundp checks come back nil
+    /// here, the substrate path resolution returned a clone that
+    /// doesn't have Phase 1.E (= 2026-05-05) yet.
+    #[test]
+    fn substrate_phase_1e_is_loaded() {
+        let mut s = Session::new();
+        let setup = s.eval_to_string(&layer2_setup_form());
+        assert!(!setup.starts_with("ERR "), "layer2 setup failed: {setup}");
+        eprintln!("layer2_src_path() = {}", layer2_src_path());
+        eprintln!(
+            "(fboundp 'window-system) = {}",
+            s.eval_to_string("(fboundp 'window-system)")
+        );
+        eprintln!(
+            "(fboundp 'emacs-display-window-system) = {}",
+            s.eval_to_string("(fboundp 'emacs-display-window-system)")
+        );
+        eprintln!(
+            "(boundp 'emacs-display-system) = {}",
+            s.eval_to_string("(boundp 'emacs-display-system)")
+        );
+        // Hard assertion: after `(require 'emacs-init)` the substrate
+        // Phase 1.E surface MUST be present.
+        assert_eq!(
+            s.eval_to_string("(fboundp 'emacs-display-window-system)"),
+            "t",
+            "substrate at {} is missing Phase 1.E (emacs-display-window-system)",
+            layer2_src_path()
+        );
+        assert_eq!(
+            s.eval_to_string("(boundp 'emacs-display-system)"),
+            "t",
+            "substrate at {} is missing emacs-display-system defvar",
+            layer2_src_path()
+        );
+        assert_eq!(
+            s.eval_to_string("(fboundp 'window-system)"),
+            "t",
+            "window-system not bound after `(require 'emacs-init)' — \
+             stale .elc cached or wrong load-path?"
+        );
+    }
+
     #[test]
     fn display_system_setup_is_idempotent() {
         let mut s = Session::new();
