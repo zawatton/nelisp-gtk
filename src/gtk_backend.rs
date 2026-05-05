@@ -70,6 +70,11 @@ pub struct GtkState {
     pub key_queue: VecDeque<KeyEvent>,
     pub menu_event_queue: VecDeque<String>,
     pub mouse_event_queue: VecDeque<MouseEvent>,
+    /// Pending (rows, cols) tuples surfaced by the DrawingArea's
+    /// `resize' signal — drained by the elisp main loop via
+    /// `(nelisp-gtk-poll-resize)' so the frontend can re-clamp its
+    /// rows/cols defvars + repaint at the new dimensions.
+    pub resize_queue: VecDeque<(usize, usize)>,
     pub quit: bool,
 }
 
@@ -88,6 +93,7 @@ impl GtkState {
             key_queue: VecDeque::new(),
             menu_event_queue: VecDeque::new(),
             mouse_event_queue: VecDeque::new(),
+            resize_queue: VecDeque::new(),
             quit: false,
         }
     }
@@ -387,6 +393,30 @@ pub fn register_all(env: &mut Env, state: Rc<RefCell<GtkState>>) {
             clip.set_text(&text);
             Ok(Sexp::T)
         });
+    }
+
+    // ----- nelisp-gtk-poll-resize () -> (ROWS COLS) | nil -----
+    //
+    // Drained by the elisp main loop after each `iterate' wake.
+    // ROWS / COLS are 1-based cell counts the DrawingArea now
+    // accommodates (= GTK gave the area `pixel-W x pixel-H', we
+    // floor-divided by the per-cell metrics).  Frontend must
+    // refresh its rows/cols defvars + mode-line-row + repaint.
+    {
+        let st = state.clone();
+        env.register_extern_builtin(
+            "nelisp-gtk-poll-resize",
+            move |_args, _env| {
+                let mut g = st.borrow_mut();
+                match g.resize_queue.pop_front() {
+                    Some((r, c)) => Ok(Sexp::list_from(&[
+                        Sexp::Int(r as i64),
+                        Sexp::Int(c as i64),
+                    ])),
+                    None => Ok(Sexp::Nil),
+                }
+            },
+        );
     }
 
     // ----- nelisp-gtk-show-open-dialog &optional TITLE -> PATH | nil -----
@@ -786,6 +816,37 @@ fn build_window(
     let area = DrawingArea::new();
     area.set_content_width(canvas_w);
     area.set_content_height(canvas_h);
+    area.set_hexpand(true);
+    area.set_vexpand(true);
+
+    // Resize hook — when GTK reallocates the area's pixel rect we
+    // recompute (rows, cols) against the cached cell metrics.  If
+    // the cell-grid count actually changed, we replace `grid' with
+    // a freshly blanked one of the new dimensions and surface the
+    // new (rows, cols) on `resize_queue' so the elisp frontend can
+    // pull it on its next iterate-poll cycle.
+    let st_for_resize = state.clone();
+    area.connect_resize(move |_a, w, h| {
+        if w <= 0 || h <= 0 {
+            return;
+        }
+        let mut g = st_for_resize.borrow_mut();
+        if g.cell_w <= 0.0 || g.cell_h <= 0.0 {
+            return; // pre-init paint; metrics not yet probed
+        }
+        let cols = ((w as f64) / g.cell_w).floor() as usize;
+        let rows = ((h as f64) / g.cell_h).floor() as usize;
+        // Floor below 1 cell would deadlock the frontend's paint
+        // loop; clamp to a usable minimum.  GTK enforces a min
+        // size via the area's content width/height anyway, so this
+        // is a defensive cap.
+        let cols = cols.max(20);
+        let rows = rows.max(5);
+        if cols != g.grid.cols || rows != g.grid.rows {
+            g.grid = CharGrid::blank(rows, cols);
+            g.resize_queue.push_back((rows, cols));
+        }
+    });
 
     // ----- Draw callback — paints the current grid + cursor + mode-line.
     let st_for_draw = state.clone();
@@ -895,7 +956,10 @@ fn build_window(
     let window = ApplicationWindow::builder()
         .application(app)
         .title("nemacs-gtk")
-        .resizable(false)
+        // Phase 2.I: window is now resizable; the DrawingArea's
+        // `resize' signal forwards new (rows, cols) to elisp via
+        // `resize_queue' so the grid follows the user's drag.
+        .resizable(true)
         .child(&area)
         .build();
     window.add_controller(key_controller);
