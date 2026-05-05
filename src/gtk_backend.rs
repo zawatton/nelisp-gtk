@@ -359,6 +359,28 @@ pub fn register_all(env: &mut Env, state: Rc<RefCell<GtkState>>) {
         );
     }
 
+    // ----- nelisp-gtk-show-context-menu SPEC ROW COL -----
+    //
+    // SPEC is a flat list of `(LABEL . ACTION-NAME-STRING)' leaves —
+    // the same shape as a menu submenu but without nesting.  Pops a
+    // `gtk::PopoverMenu' anchored at cell coords (ROW, COL) of the
+    // drawing area; clicking an entry pushes ACTION-NAME-STRING onto
+    // the same `menu_event_queue' the menubar uses, so the elisp
+    // dispatcher (= `(nelisp-gtk-poll-menu-event)' →
+    // `--handle-menu-action') reuses without modification.
+    //
+    // Errors when the GTK app/area aren't initialised yet.  Returns t
+    // on successful popup.
+    {
+        let st = state.clone();
+        env.register_extern_builtin("nelisp-gtk-show-context-menu", move |args, _env| {
+            let spec = args.get(0).cloned().unwrap_or(Sexp::Nil);
+            let row = want_int(args, 1, "nelisp-gtk-show-context-menu")?;
+            let col = want_int(args, 2, "nelisp-gtk-show-context-menu")?;
+            show_context_menu(&st, &spec, row, col)
+        });
+    }
+
     // ----- nelisp-gtk-poll-mouse () -> (KIND BUTTON ROW COL MODS) | nil -----
     //
     // KIND symbols: 'press / 'release / 'scroll-up / 'scroll-down.
@@ -762,6 +784,81 @@ fn install_leaf_action(
             .push_back(action_name_owned.clone());
     });
     app.add_action(&action);
+}
+
+/// Pop a context menu (= `gtk::PopoverMenu') anchored at cell (ROW, COL)
+/// of the drawing area.  SPEC is a flat list of `(LABEL . ACTION-NAME)'
+/// leaves; clicking an entry pushes ACTION-NAME onto the same
+/// `menu_event_queue' the menubar uses.
+///
+/// Cell coords (= row, col) are converted to pixel coords via the cached
+/// `cell_w' / `cell_h' on `GtkState' so the popover anchors at the same
+/// pixel the user clicked.  A 1x1 `gdk::Rectangle' is enough — GTK
+/// auto-positions the popover above/below the rectangle as space allows.
+///
+/// Cleanup: the popover is parented on the drawing area + auto-unparented
+/// on dismiss via a deferred `glib::idle_add_local_once' (= avoids
+/// reentry while GTK is mid-`closed' signal).  Without that, every
+/// right-click would leak a hidden popover.
+fn show_context_menu(
+    state: &Rc<RefCell<GtkState>>,
+    spec: &Sexp,
+    row: i64,
+    col: i64,
+) -> Result<Sexp, EvalError> {
+    let (app, area, cell_w, cell_h) = {
+        let g = state.borrow();
+        match (g.app.clone(), g.area.clone()) {
+            (Some(a), Some(ar)) => (a, ar, g.cell_w, g.cell_h),
+            _ => {
+                return Err(EvalError::Internal(
+                    "nelisp-gtk-show-context-menu: GTK not initialised — \
+                     call `(nelisp-gtk-init ROWS COLS)' first"
+                        .into(),
+                ));
+            }
+        }
+    };
+
+    let menu = gio::Menu::new();
+    let mut leaf_count: usize = 0;
+    for entry in sexp_list_iter(spec) {
+        if let Sexp::Cons(h, t) = &entry {
+            let head = h.borrow().clone();
+            let tail = t.borrow().clone();
+            let label = match head.as_string_owned() {
+                Some(s) => s,
+                None => continue,
+            };
+            let action_name = match tail.as_string_owned() {
+                Some(s) => s,
+                None => continue,
+            };
+            install_leaf_action(&menu, &app, state, &label, &action_name);
+            leaf_count += 1;
+        }
+    }
+    if leaf_count == 0 {
+        return Ok(Sexp::Nil);
+    }
+
+    let popover = gtk::PopoverMenu::from_model(Some(&menu));
+    popover.set_parent(&area);
+    popover.set_has_arrow(false);
+    let x = ((col as f64) * cell_w) as i32;
+    let y = ((row as f64) * cell_h) as i32;
+    popover.set_pointing_to(Some(&gdk::Rectangle::new(x, y, 1, 1)));
+    {
+        let popover_clone = popover.clone();
+        popover.connect_closed(move |_| {
+            let p = popover_clone.clone();
+            glib::idle_add_local_once(move || {
+                p.unparent();
+            });
+        });
+    }
+    popover.popup();
+    Ok(Sexp::T)
 }
 
 /// Iterate over a Sexp proper list (= Cons chain terminated by Nil).
