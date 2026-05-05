@@ -395,6 +395,24 @@ pub fn register_all(env: &mut Env, state: Rc<RefCell<GtkState>>) {
         });
     }
 
+    // ----- nelisp-gtk-set-window-title TITLE -----
+    //
+    // Update the GTK ApplicationWindow's titlebar.  Frontend calls
+    // this whenever the active buffer changes / a file is loaded /
+    // saved-as, so the OS window title tracks "what the user is
+    // looking at".  No-op when the window isn't up.
+    {
+        let st = state.clone();
+        env.register_extern_builtin("nelisp-gtk-set-window-title", move |args, _env| {
+            let title = want_string(args, 0, "nelisp-gtk-set-window-title")?;
+            let g = st.borrow();
+            if let Some(w) = &g.window {
+                w.set_title(Some(&title));
+            }
+            Ok(Sexp::Nil)
+        });
+    }
+
     // ----- nelisp-gtk-poll-resize () -> (ROWS COLS) | nil -----
     //
     // Drained by the elisp main loop after each `iterate' wake.
