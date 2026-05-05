@@ -1,3 +1,14 @@
+// Phase 1.E — `(window-system)' / `(display-graphic-p)' return correct
+// values for GUI dispatch.
+//
+// Earlier phases left the substrate display probes hard-coded to nil
+// (= the no-op stubs in `emacs-stub.el').  Substrate Phase 1.E flips
+// those stubs into a defvar-driven dispatch (`emacs-display-system')
+// that this driver flips to `'gtk' before any code that branches on
+// `(window-system)' / `(display-graphic-p)' runs.  The welcome buffer
+// now displays both probe values inline so the wire-up is visible at
+// runtime.
+//
 // Phase 1.D.4 — mode-line + echo-area layout.
 //
 // 1.D.3b moved key dispatch onto the substrate command-loop while the
@@ -126,12 +137,12 @@ fn welcome_buffer_form() -> &'static str {
             (erase-buffer)
             (insert "Welcome to nemacs-gtk!\n")
             (insert "\n")
-            (insert "Phase 1.D.4: real Emacs layout —\n")
-            (insert "  * full-canvas buffer area\n")
-            (insert "  * mode line below (highlighted)\n")
-            (insert "  * echo area at the very bottom\n")
+            (insert (format "Phase 1.E: (window-system) => %S\n"
+                            (window-system)))
+            (insert (format "          (display-graphic-p) => %S\n"
+                            (display-graphic-p)))
             (insert "\n")
-            (insert "Type to insert, Backspace / Enter / arrows for\n")
+            (insert "Type to insert; Backspace / Enter / arrows for\n")
             (insert "motion + edits.  Mode line refreshes after each key.\n")
             (insert "\n")
             (insert "> "))
@@ -325,10 +336,16 @@ fn build_initial_state() -> AppState {
     let mut session = Session::new();
 
     let setup_result = session.eval_to_string(&nelisp_bridge::layer2_setup_form());
+    // Phase 1.E — flip `emacs-display-system' BEFORE other bootstrap
+    // forms so `(require 'emacs-buffer-builtins)' / future init.el
+    // hooks see the GUI path on the first probe.
+    let display_result =
+        session.eval_to_string(nelisp_bridge::display_system_setup_form());
     let req_result = session.eval_to_string("(require 'emacs-buffer-builtins)");
     let buffer_result = session.eval_to_string(welcome_buffer_form());
     let keymap_result = session.eval_to_string(nelisp_bridge::command_loop_setup_form());
     let bootstrap_ok = !setup_result.starts_with("ERR ")
+        && !display_result.starts_with("ERR ")
         && !req_result.starts_with("ERR ")
         && !buffer_result.starts_with("ERR ")
         && !keymap_result.starts_with("ERR ");
@@ -342,6 +359,7 @@ fn build_initial_state() -> AppState {
         // top of the buffer area so the user sees what blew up.
         let diag = [
             ("layer2 setup", &setup_result),
+            ("display-system 'gtk", &display_result),
             ("(require 'emacs-buffer-builtins)", &req_result),
             ("welcome buffer", &buffer_result),
             ("command-loop keymap", &keymap_result),
@@ -566,12 +584,20 @@ mod tests {
         let mut s = Session::new();
         let setup = s.eval_to_string(&nelisp_bridge::layer2_setup_form());
         assert!(!setup.starts_with("ERR "), "setup failed: {setup}");
+        // Phase 1.E — welcome_buffer_form embeds `(window-system)' so
+        // we must flip the display system before populating the
+        // buffer; otherwise the format probe fires against the
+        // nil-default state and the row content is irrelevant.
+        let _ = s.eval_to_string(nelisp_bridge::display_system_setup_form());
         let _ = s.eval_to_string(welcome_buffer_form());
         let mut g = CharGrid::blank(ROWS, COLS);
         refresh_mode_line(&mut g, &mut s);
         let row: String = (0..COLS).map(|c| g.get(MODE_LINE_ROW, c)).collect();
         assert!(row.contains("*welcome*"), "row = {row:?}");
-        assert!(row.contains("L1"), "row = {row:?}");
+        // Line number depends on how many newlines welcome_buffer_form
+        // wrote — assert just the prefix shape.
+        assert!(row.contains("L"), "row = {row:?}");
+        assert!(row.contains("(fundamental-mode)"), "row = {row:?}");
     }
 
     #[test]

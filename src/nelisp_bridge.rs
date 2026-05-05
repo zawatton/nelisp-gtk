@@ -134,6 +134,28 @@ pub fn layer2_setup_form() -> String {
     )
 }
 
+/// Phase 1.E — declare this Session as a graphic GTK display so
+/// substrate code that branches on `(window-system)' /
+/// `(display-graphic-p)' picks the GUI path.
+///
+/// Sets:
+///   `emacs-display-system'     → 'gtk
+///   `initial-window-system'    → 'gtk  (= public name parity)
+///
+/// Run after `layer2_setup_form' (= the defvars are bootstrapped
+/// inside `emacs-stub.el' which `emacs-init' chains).  Idempotent —
+/// re-running is a plain `setq' rebind.  Layer 2's
+/// `emacs-display-window-system' / `emacs-display-graphic-p' /
+/// `emacs-display-color-p' / `emacs-display-multi-frame-p' all
+/// dispatch off `emacs-display-system', so flipping it once is
+/// enough to flip the whole probe surface.
+pub fn display_system_setup_form() -> &'static str {
+    r#"(progn
+        (setq emacs-display-system 'gtk)
+        (setq initial-window-system 'gtk)
+        emacs-display-system)"#
+}
+
 /// Phase 1.D.3b — install a minimal global keymap so the substrate's
 /// `emacs-command-loop-step' can resolve our GTK-derived events.
 ///
@@ -337,6 +359,36 @@ mod tests {
         // (= idempotent / second use-global-map replaces the first).
         let r = s.eval_to_string(command_loop_setup_form());
         assert_eq!(r, "keymap-ready");
+    }
+
+    #[test]
+    fn display_system_setup_flips_window_system_to_gtk() {
+        let mut s = Session::new();
+        let setup = s.eval_to_string(&layer2_setup_form());
+        assert!(!setup.starts_with("ERR "), "layer2 setup failed: {setup}");
+        // Before the flip, window-system / display-graphic-p default
+        // to nil (= the substrate's documented "no display" baseline).
+        assert_eq!(s.eval_to_string("(window-system)"), "nil");
+        assert_eq!(s.eval_to_string("(display-graphic-p)"), "nil");
+        let r = s.eval_to_string(display_system_setup_form());
+        assert_eq!(r, "gtk", "display setup returned {r}");
+        assert_eq!(s.eval_to_string("(window-system)"), "gtk");
+        assert_eq!(s.eval_to_string("(display-graphic-p)"), "t");
+        assert_eq!(s.eval_to_string("(display-color-p)"), "t");
+        assert_eq!(s.eval_to_string("(display-multi-frame-p)"), "t");
+        // Public-name parity: `initial-window-system' mirrors the value.
+        assert_eq!(s.eval_to_string("initial-window-system"), "gtk");
+    }
+
+    #[test]
+    fn display_system_setup_is_idempotent() {
+        let mut s = Session::new();
+        let _ = s.eval_to_string(&layer2_setup_form());
+        let r1 = s.eval_to_string(display_system_setup_form());
+        let r2 = s.eval_to_string(display_system_setup_form());
+        assert_eq!(r1, "gtk");
+        assert_eq!(r2, "gtk");
+        assert_eq!(s.eval_to_string("emacs-display-system"), "gtk");
     }
 
     #[test]
