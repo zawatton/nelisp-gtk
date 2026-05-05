@@ -42,6 +42,11 @@ pub struct KeyEvent {
 pub enum MouseKind {
     Press,
     Release,
+    /// Pointer motion while at least one button is held (= drag).
+    /// Phase 2.U — motion without a button held is suppressed at the
+    /// controller layer to avoid flooding the queue when the user is
+    /// just hovering.
+    Motion,
     ScrollUp,
     ScrollDown,
 }
@@ -70,6 +75,12 @@ pub struct GtkState {
     pub key_queue: VecDeque<KeyEvent>,
     pub menu_event_queue: VecDeque<String>,
     pub mouse_event_queue: VecDeque<MouseEvent>,
+    /// Most-recently-pressed mouse button that has not yet been
+    /// released — populated by `GestureClick::connect_pressed' and
+    /// cleared by `connect_released'.  The motion controller checks
+    /// this to decide whether to emit `MouseKind::Motion' events
+    /// (= drag in progress) or drop the hover (= avoid queue flood).
+    pub mouse_pressed_button: Option<u32>,
     /// Pending (rows, cols) tuples surfaced by the DrawingArea's
     /// `resize' signal — drained by the elisp main loop via
     /// `(nelisp-gtk-poll-resize)' so the frontend can re-clamp its
@@ -93,6 +104,7 @@ impl GtkState {
             key_queue: VecDeque::new(),
             menu_event_queue: VecDeque::new(),
             mouse_event_queue: VecDeque::new(),
+            mouse_pressed_button: None,
             resize_queue: VecDeque::new(),
             quit: false,
         }
@@ -184,6 +196,7 @@ fn mouse_event_to_sexp(ev: MouseEvent) -> Sexp {
     let kind = match ev.kind {
         MouseKind::Press => "press",
         MouseKind::Release => "release",
+        MouseKind::Motion => "motion",
         MouseKind::ScrollUp => "scroll-up",
         MouseKind::ScrollDown => "scroll-down",
     };
@@ -1033,23 +1046,46 @@ fn build_window(
     // ----- Mouse click controller — press + release on any button.
     // GestureClick with `set_button(0)' captures every button so we
     // can distinguish 1/2/3 (= left/middle/right) on the elisp side.
+    // Phase 2.U: press/release also stamp `mouse_pressed_button' so
+    // the motion controller knows whether the user is dragging.
     let click = gtk::GestureClick::new();
     click.set_button(0);
     let st_for_press = state.clone();
     click.connect_pressed(move |gesture, _n_press, x, y| {
-        push_mouse(&st_for_press, MouseKind::Press, gesture.current_button(), x, y);
+        let button = gesture.current_button();
+        st_for_press.borrow_mut().mouse_pressed_button = Some(button);
+        push_mouse(&st_for_press, MouseKind::Press, button, x, y);
     });
     let st_for_release = state.clone();
     click.connect_released(move |gesture, _n_press, x, y| {
-        push_mouse(
-            &st_for_release,
-            MouseKind::Release,
-            gesture.current_button(),
-            x,
-            y,
-        );
+        let button = gesture.current_button();
+        {
+            let mut g = st_for_release.borrow_mut();
+            // Only clear when the released button matches the held one
+            // — guards against multi-button presses where a stale
+            // release from a different button would otherwise unstick
+            // the drag state.
+            if g.mouse_pressed_button == Some(button) {
+                g.mouse_pressed_button = None;
+            }
+        }
+        push_mouse(&st_for_release, MouseKind::Release, button, x, y);
     });
     area.add_controller(click);
+
+    // ----- Mouse motion controller — emit `MouseKind::Motion' events
+    // only while a button is held (= drag).  Hover-only motion is
+    // suppressed to avoid flooding the elisp queue between drags.
+    // Phase 2.U.
+    let motion_ctl = gtk::EventControllerMotion::new();
+    let st_for_motion = state.clone();
+    motion_ctl.connect_motion(move |_c, x, y| {
+        let held = st_for_motion.borrow().mouse_pressed_button;
+        if let Some(button) = held {
+            push_mouse(&st_for_motion, MouseKind::Motion, button, x, y);
+        }
+    });
+    area.add_controller(motion_ctl);
 
     // ----- Scroll wheel controller — direction-only for MVP.
     let scroll = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::VERTICAL);
