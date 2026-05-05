@@ -36,6 +36,25 @@ pub struct KeyEvent {
     pub unicode: u32,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub enum MouseKind {
+    Press,
+    Release,
+    ScrollUp,
+    ScrollDown,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct MouseEvent {
+    pub kind: MouseKind,
+    /// GDK button number (= 1/2/3 = left/middle/right).  Carried for
+    /// press / release; meaningless for scroll (set to 0).
+    pub button: u32,
+    pub row: usize,
+    pub col: usize,
+    pub mods: u32,
+}
+
 pub struct GtkState {
     pub initialized: bool,
     pub app: Option<Application>,
@@ -48,6 +67,7 @@ pub struct GtkState {
     pub mode_line_row: Option<usize>,
     pub key_queue: VecDeque<KeyEvent>,
     pub menu_event_queue: VecDeque<String>,
+    pub mouse_event_queue: VecDeque<MouseEvent>,
     pub quit: bool,
 }
 
@@ -65,6 +85,7 @@ impl GtkState {
             mode_line_row: None,
             key_queue: VecDeque::new(),
             menu_event_queue: VecDeque::new(),
+            mouse_event_queue: VecDeque::new(),
             quit: false,
         }
     }
@@ -117,6 +138,53 @@ fn key_event_to_sexp(ev: KeyEvent) -> Sexp {
         Sexp::Int(ev.keysym as i64),
         Sexp::Int(ev.mods as i64),
         Sexp::Int(ev.unicode as i64),
+    ])
+}
+
+/// Push a press/release event onto the mouse queue.  Converts the
+/// raw pixel coords (= what GTK hands the gesture callback) into
+/// 0-based cell `(row, col)' against the current cell metrics.
+/// Coords past the canvas edge clamp to the last valid cell.
+fn push_mouse(
+    state: &Rc<RefCell<GtkState>>,
+    kind: MouseKind,
+    button: u32,
+    x: f64,
+    y: f64,
+) {
+    let mut g = state.borrow_mut();
+    if g.cell_w <= 0.0 || g.cell_h <= 0.0 {
+        return; // pre-init paint pass — drop event
+    }
+    let col = (x / g.cell_w).floor().max(0.0) as usize;
+    let row = (y / g.cell_h).floor().max(0.0) as usize;
+    let col = col.min(g.grid.cols.saturating_sub(1));
+    let row = row.min(g.grid.rows.saturating_sub(1));
+    g.mouse_event_queue.push_back(MouseEvent {
+        kind,
+        button,
+        row,
+        col,
+        mods: 0,
+    });
+}
+
+/// Convert a mouse event to the elisp tuple `(KIND BUTTON ROW COL MODS)`.
+/// KIND is a quoted symbol ('press / 'release / 'scroll-up / 'scroll-down)
+/// so the frontend can `eq'-dispatch.
+fn mouse_event_to_sexp(ev: MouseEvent) -> Sexp {
+    let kind = match ev.kind {
+        MouseKind::Press => "press",
+        MouseKind::Release => "release",
+        MouseKind::ScrollUp => "scroll-up",
+        MouseKind::ScrollDown => "scroll-down",
+    };
+    Sexp::list_from(&[
+        Sexp::Symbol(kind.into()),
+        Sexp::Int(ev.button as i64),
+        Sexp::Int(ev.row as i64),
+        Sexp::Int(ev.col as i64),
+        Sexp::Int(ev.mods as i64),
     ])
 }
 
@@ -277,6 +345,25 @@ pub fn register_all(env: &mut Env, state: Rc<RefCell<GtkState>>) {
                 let mut g = st.borrow_mut();
                 match g.menu_event_queue.pop_front() {
                     Some(s) => Ok(Sexp::Str(s)),
+                    None => Ok(Sexp::Nil),
+                }
+            },
+        );
+    }
+
+    // ----- nelisp-gtk-poll-mouse () -> (KIND BUTTON ROW COL MODS) | nil -----
+    //
+    // KIND symbols: 'press / 'release / 'scroll-up / 'scroll-down.
+    // ROW / COL are 0-based cell coords (= pixel coords ÷ cell metrics).
+    // BUTTON is the GDK button number for press/release, 0 for scroll.
+    {
+        let st = state.clone();
+        env.register_extern_builtin(
+            "nelisp-gtk-poll-mouse",
+            move |_args, _env| {
+                let mut g = st.borrow_mut();
+                match g.mouse_event_queue.pop_front() {
+                    Some(ev) => Ok(mouse_event_to_sexp(ev)),
                     None => Ok(Sexp::Nil),
                 }
             },
@@ -529,6 +616,44 @@ fn build_window(
         st_for_key.borrow_mut().key_queue.push_back(ev);
         glib::Propagation::Proceed
     });
+
+    // ----- Mouse click controller — press + release on any button.
+    // GestureClick with `set_button(0)' captures every button so we
+    // can distinguish 1/2/3 (= left/middle/right) on the elisp side.
+    let click = gtk::GestureClick::new();
+    click.set_button(0);
+    let st_for_press = state.clone();
+    click.connect_pressed(move |gesture, _n_press, x, y| {
+        push_mouse(&st_for_press, MouseKind::Press, gesture.current_button(), x, y);
+    });
+    let st_for_release = state.clone();
+    click.connect_released(move |gesture, _n_press, x, y| {
+        push_mouse(
+            &st_for_release,
+            MouseKind::Release,
+            gesture.current_button(),
+            x,
+            y,
+        );
+    });
+    area.add_controller(click);
+
+    // ----- Scroll wheel controller — direction-only for MVP.
+    let scroll = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::VERTICAL);
+    let st_for_scroll = state.clone();
+    scroll.connect_scroll(move |_c, _dx, dy| {
+        let kind = if dy < 0.0 {
+            MouseKind::ScrollUp
+        } else if dy > 0.0 {
+            MouseKind::ScrollDown
+        } else {
+            return glib::Propagation::Proceed;
+        };
+        let ev = MouseEvent { kind, button: 0, row: 0, col: 0, mods: 0 };
+        st_for_scroll.borrow_mut().mouse_event_queue.push_back(ev);
+        glib::Propagation::Proceed
+    });
+    area.add_controller(scroll);
 
     let window = ApplicationWindow::builder()
         .application(app)
