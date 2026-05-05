@@ -47,6 +47,7 @@ pub struct GtkState {
     pub cursor: Option<(usize, usize)>,
     pub mode_line_row: Option<usize>,
     pub key_queue: VecDeque<KeyEvent>,
+    pub menu_event_queue: VecDeque<String>,
     pub quit: bool,
 }
 
@@ -63,6 +64,7 @@ impl GtkState {
             cursor: None,
             mode_line_row: None,
             key_queue: VecDeque::new(),
+            menu_event_queue: VecDeque::new(),
             quit: false,
         }
     }
@@ -245,6 +247,166 @@ pub fn register_all(env: &mut Env, state: Rc<RefCell<GtkState>>) {
             Ok(if g.quit { Sexp::T } else { Sexp::Nil })
         });
     }
+
+    // ----- nelisp-gtk-set-menu-bar SPEC -----
+    //
+    // SPEC shape (= elisp data, walked recursively):
+    //
+    //   ((LABEL  ENTRY  ENTRY ...)        ; submenu
+    //    (LABEL . ACTION-NAME-STRING))    ; leaf
+    //
+    // Both LABELs and ACTION-NAME-STRINGs are elisp strings.  When a
+    // leaf is clicked the ACTION-NAME-STRING is pushed onto the
+    // `menu_event_queue' so elisp can `(nelisp-gtk-poll-menu-event)'
+    // and dispatch.  Calling this builtin a second time replaces the
+    // previous menu model.
+    {
+        let st = state.clone();
+        env.register_extern_builtin("nelisp-gtk-set-menu-bar", move |args, _env| {
+            let spec = args.get(0).cloned().unwrap_or(Sexp::Nil);
+            install_menu_bar(&st, &spec)
+        });
+    }
+
+    // ----- nelisp-gtk-poll-menu-event () -> STRING | nil -----
+    {
+        let st = state.clone();
+        env.register_extern_builtin(
+            "nelisp-gtk-poll-menu-event",
+            move |_args, _env| {
+                let mut g = st.borrow_mut();
+                match g.menu_event_queue.pop_front() {
+                    Some(s) => Ok(Sexp::Str(s)),
+                    None => Ok(Sexp::Nil),
+                }
+            },
+        );
+    }
+}
+
+/// Walk a `Sexp' menu SPEC and install it as the application's
+/// menubar.  See the comment on the `nelisp-gtk-set-menu-bar' builtin
+/// for the SPEC shape.  Errors out if no Application + Window are up
+/// yet (= caller forgot to `(nelisp-gtk-init ...)' first).
+fn install_menu_bar(
+    state: &Rc<RefCell<GtkState>>,
+    spec: &Sexp,
+) -> Result<Sexp, EvalError> {
+    // Safety: we read app + window once, drop the borrow before
+    // mutating GTK state — `set_menubar' / `add_action' don't re-enter
+    // our state, so no double-borrow risk.
+    let (app, window) = {
+        let g = state.borrow();
+        match (g.app.clone(), g.window.clone()) {
+            (Some(a), Some(w)) => (a, w),
+            _ => {
+                return Err(EvalError::Internal(
+                    "nelisp-gtk-set-menu-bar: window not initialised — \
+                     call `(nelisp-gtk-init ROWS COLS)' first"
+                        .into(),
+                ));
+            }
+        }
+    };
+
+    // Drop pre-existing menu actions so re-running this builtin yields
+    // a clean menubar.  We use a fixed prefix `menu-' for our actions
+    // so a partial wipe is safe.
+    for action_name in app.list_actions() {
+        let s: String = action_name.into();
+        if s.starts_with("menu-") {
+            app.remove_action(&s);
+        }
+    }
+
+    let root = gio::Menu::new();
+    build_menu_recursive(&root, spec, &app, state);
+    app.set_menubar(Some(&root));
+    window.set_show_menubar(true);
+    Ok(Sexp::T)
+}
+
+/// Recursively populate `parent' from `entries' (= a Sexp list whose
+/// each element is a menu entry).  See `install_menu_bar' for shape.
+fn build_menu_recursive(
+    parent: &gio::Menu,
+    entries: &Sexp,
+    app: &Application,
+    state: &Rc<RefCell<GtkState>>,
+) {
+    for entry in sexp_list_iter(entries) {
+        // Each entry must be a cons cell (LABEL . REST).
+        let (label, rest) = match &entry {
+            Sexp::Cons(h, t) => {
+                let head = h.borrow().clone();
+                let tail = t.borrow().clone();
+                let label = match head.as_string_owned() {
+                    Some(s) => s,
+                    None => continue,
+                };
+                (label, tail)
+            }
+            _ => continue,
+        };
+        match rest {
+            // Leaf: cdr is a string action name.
+            ref s if s.is_string() => {
+                let action_name = s.as_string_owned().unwrap_or_default();
+                install_leaf_action(parent, app, state, &label, &action_name);
+            }
+            // Submenu: cdr is a list of more entries.
+            ref s if matches!(s, Sexp::Cons(_, _) | Sexp::Nil) => {
+                let sub = gio::Menu::new();
+                build_menu_recursive(&sub, s, app, state);
+                parent.append_submenu(Some(&label), &sub);
+            }
+            _ => continue,
+        }
+    }
+}
+
+fn install_leaf_action(
+    menu: &gio::Menu,
+    app: &Application,
+    state: &Rc<RefCell<GtkState>>,
+    label: &str,
+    action_name: &str,
+) {
+    // GAction names live in the app's action group; reference them
+    // from the menu model via "app.<name>".  Prefix everything with
+    // `menu-' so `nelisp-gtk-set-menu-bar' can wipe its slice cleanly
+    // on re-install (= avoid colliding with any future built-in
+    // app actions).
+    let gaction_name = format!("menu-{action_name}");
+    let action_target = format!("app.{gaction_name}");
+    menu.append(Some(label), Some(&action_target));
+
+    let action = gio::SimpleAction::new(&gaction_name, None);
+    let st = state.clone();
+    let action_name_owned = action_name.to_string();
+    action.connect_activate(move |_, _| {
+        st.borrow_mut()
+            .menu_event_queue
+            .push_back(action_name_owned.clone());
+    });
+    app.add_action(&action);
+}
+
+/// Iterate over a Sexp proper list (= Cons chain terminated by Nil).
+/// Stops at the first non-Cons cdr (= dotted pair / improper list).
+fn sexp_list_iter(s: &Sexp) -> Vec<Sexp> {
+    let mut out = Vec::new();
+    let mut cur = s.clone();
+    loop {
+        match cur {
+            Sexp::Cons(h, t) => {
+                out.push(h.borrow().clone());
+                cur = t.borrow().clone();
+            }
+            _ => break,
+        }
+    }
+    out
 }
 
 /// Build the GTK Application + Window + DrawingArea + key controller.
