@@ -13,6 +13,7 @@
 
 use std::cell::RefCell;
 use std::collections::VecDeque;
+use std::path::PathBuf;
 use std::rc::Rc;
 
 use gtk::gdk;
@@ -388,6 +389,38 @@ pub fn register_all(env: &mut Env, state: Rc<RefCell<GtkState>>) {
         });
     }
 
+    // ----- nelisp-gtk-show-open-dialog &optional TITLE -> PATH | nil -----
+    //
+    // Open a native GTK4 `FileDialog' rooted at the application
+    // window (= modal).  Returns the absolute path string the user
+    // selected, or nil on cancel / error.  Synchronous from elisp's
+    // POV by spinning the GLib main loop until the async callback
+    // fires — same pattern as the clipboard read but without the
+    // 500ms timeout (= dialog is modal, user must dismiss).
+    {
+        let st = state.clone();
+        env.register_extern_builtin("nelisp-gtk-show-open-dialog", move |args, _env| {
+            let title = match args.get(0) {
+                Some(s) if s.is_string() => s.as_string_owned().unwrap_or_default(),
+                _ => "Open File".to_string(),
+            };
+            let parent = {
+                let g = st.borrow();
+                if !g.initialized {
+                    return Err(EvalError::Internal(
+                        "nelisp-gtk-show-open-dialog: window not initialised — \
+                         call `(nelisp-gtk-init ROWS COLS)' first"
+                            .into(),
+                    ));
+                }
+                g.window.clone()
+            };
+            Ok(show_open_dialog_sync(&title, parent.as_ref())
+                .map(|p| Sexp::Str(p.to_string_lossy().to_string()))
+                .unwrap_or(Sexp::Nil))
+        });
+    }
+
     // ----- nelisp-gtk-clipboard-get () -> STRING | nil -----
     //
     // Synchronously fetch the current clipboard text via GDK's async
@@ -435,6 +468,44 @@ fn clipboard_for(
         }
     };
     Ok(display.clipboard())
+}
+
+/// Synchronously show a GTK4 `FileDialog' open prompt rooted at
+/// `parent'.  Returns the selected path or None on cancel / error.
+/// Spins the default `MainContext' until the async callback fills
+/// the result cell — no timeout because the dialog is modal and
+/// user-driven.
+fn show_open_dialog_sync(
+    title: &str,
+    parent: Option<&ApplicationWindow>,
+) -> Option<PathBuf> {
+    let dialog = gtk::FileDialog::new();
+    dialog.set_title(title);
+    dialog.set_modal(true);
+
+    let result: Rc<RefCell<Option<Option<PathBuf>>>> = Rc::new(RefCell::new(None));
+    let result_cb = result.clone();
+    dialog.open(
+        parent,
+        None::<&gtk::gio::Cancellable>,
+        move |res| {
+            let path = match res {
+                Ok(file) => file.path(),
+                Err(_) => None,
+            };
+            *result_cb.borrow_mut() = Some(path);
+        },
+    );
+
+    let ctx = glib::MainContext::default();
+    loop {
+        if result.borrow().is_some() {
+            break;
+        }
+        ctx.iteration(true);
+    }
+    let out = result.borrow().clone().flatten();
+    out
 }
 
 /// Synchronously read text off `clipboard'.  Bridges GTK4's async-only

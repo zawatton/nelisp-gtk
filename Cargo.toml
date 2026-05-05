@@ -10,7 +10,9 @@ name = "nemacs-gtk"
 path = "src/main.rs"
 
 [dependencies]
-gtk = { package = "gtk4", version = "0.9" }
+# `v4_10' enables `gtk::FileDialog' (= introduced in GTK 4.10).
+# Debian 13 / Ubuntu 24.04+ ship GTK >= 4.12, so this is safe.
+gtk = { package = "gtk4", version = "0.9", features = ["v4_10"] }
 pangocairo = "0.20"
 nelisp = { package = "nelisp-build-tool", path = "../nelisp/build-tool" }
 
