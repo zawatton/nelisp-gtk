@@ -1,3 +1,23 @@
+// Phase 2.A — native menu bar.
+//
+// Adds a `gio::Menu' (= GMenuModel) with File / Edit / Help menus to
+// the application.  Each item is wired to a `gio::SimpleAction':
+//
+//   File > Save     — placeholder (Phase 2.B file IO planned)
+//   File > Quit     — closes the window
+//   Edit > Cut      — placeholder (Phase 2.C clipboard planned)
+//   Edit > Copy     — placeholder (Phase 2.C)
+//   Edit > Paste    — placeholder (Phase 2.C)
+//   Help > About    — echoes "nemacs-gtk Phase 2.A"
+//
+// Placeholder actions stamp a message into the echo area + queue a
+// redraw (= same path the keyboard echo uses).  Quit calls
+// `window.close()' which propagates to GTK's app-shutdown.  When
+// later phases bring real `save-buffer' / `kill-region' / `yank'
+// commands online, the placeholder closures are replaced with
+// `command-loop-feed-events' calls so the menu dispatch routes
+// through the same Layer 2 path as the keyboard.
+//
 // Phase 1.E — `(window-system)' / `(display-graphic-p)' return correct
 // values for GUI dispatch.
 //
@@ -37,6 +57,7 @@ use std::rc::Rc;
 
 use grid::CharGrid;
 use gtk::gdk;
+use gtk::gio;
 use gtk::pango;
 use gtk::pango::FontDescription;
 use gtk::prelude::*;
@@ -129,6 +150,11 @@ fn format_mode_line(
 }
 
 fn welcome_buffer_form() -> &'static str {
+    // Probes are guarded with `fboundp' so a stale substrate (= a
+    // canonical-clone fallback that hasn't picked up Phase 1.E yet)
+    // doesn't take the welcome buffer down with a void-function error.
+    // Same shape as `(if (fboundp 'foo) (foo) 'unbound)' that real
+    // init.el uses for capability probes.
     r#"(progn
         (require 'emacs-buffer-builtins)
         (let ((buf (or (get-buffer "*welcome*")
@@ -138,10 +164,13 @@ fn welcome_buffer_form() -> &'static str {
             (insert "Welcome to nemacs-gtk!\n")
             (insert "\n")
             (insert (format "Phase 1.E: (window-system) => %S\n"
-                            (window-system)))
+                            (if (fboundp 'window-system)
+                                (window-system) 'unbound)))
             (insert (format "          (display-graphic-p) => %S\n"
-                            (display-graphic-p)))
+                            (if (fboundp 'display-graphic-p)
+                                (display-graphic-p) 'unbound)))
             (insert "\n")
+            (insert "Phase 2.A: native menu bar above (File / Edit / Help)\n")
             (insert "Type to insert; Backspace / Enter / arrows for\n")
             (insert "motion + edits.  Mode line refreshes after each key.\n")
             (insert "\n")
@@ -335,15 +364,28 @@ fn build_initial_state() -> AppState {
     let mut g = CharGrid::blank(ROWS, COLS);
     let mut session = Session::new();
 
+    eprintln!(
+        "[nemacs-gtk] layer2_src_path = {}",
+        nelisp_bridge::layer2_src_path()
+    );
     let setup_result = session.eval_to_string(&nelisp_bridge::layer2_setup_form());
+    eprintln!("[nemacs-gtk] layer2 setup = {setup_result}");
     // Phase 1.E — flip `emacs-display-system' BEFORE other bootstrap
     // forms so `(require 'emacs-buffer-builtins)' / future init.el
     // hooks see the GUI path on the first probe.
     let display_result =
         session.eval_to_string(nelisp_bridge::display_system_setup_form());
+    eprintln!("[nemacs-gtk] display setup = {display_result}");
+    eprintln!(
+        "[nemacs-gtk] (fboundp 'window-system) = {}",
+        session.eval_to_string("(fboundp 'window-system)")
+    );
     let req_result = session.eval_to_string("(require 'emacs-buffer-builtins)");
+    eprintln!("[nemacs-gtk] require buffer-builtins = {req_result}");
     let buffer_result = session.eval_to_string(welcome_buffer_form());
+    eprintln!("[nemacs-gtk] welcome buffer = {buffer_result}");
     let keymap_result = session.eval_to_string(nelisp_bridge::command_loop_setup_form());
+    eprintln!("[nemacs-gtk] keymap setup = {keymap_result}");
     let bootstrap_ok = !setup_result.starts_with("ERR ")
         && !display_result.starts_with("ERR ")
         && !req_result.starts_with("ERR ")
@@ -498,14 +540,98 @@ fn build_ui(app: &Application) {
         .title("nemacs-gtk")
         .resizable(false)
         .child(&area)
+        .show_menubar(true)
         .build();
     window.add_controller(key_controller);
+    install_menu_bar(app, &window, state.clone(), area.clone());
     window.present();
+}
+
+/// Phase 2.A — build the application menu bar (= GMenuModel) +
+/// register the SimpleActions that the items reference.  Uses
+/// `app.<name>' action targets so a future per-window menu can
+/// override individual entries via `win.<name>'.
+fn install_menu_bar(
+    app: &Application,
+    window: &ApplicationWindow,
+    state: Rc<RefCell<AppState>>,
+    area: DrawingArea,
+) {
+    let menu = gio::Menu::new();
+
+    let file = gio::Menu::new();
+    file.append(Some("Save"), Some("app.save"));
+    file.append(Some("Quit"), Some("app.quit"));
+    menu.append_submenu(Some("_File"), &file);
+
+    let edit = gio::Menu::new();
+    edit.append(Some("Cut"), Some("app.cut"));
+    edit.append(Some("Copy"), Some("app.copy"));
+    edit.append(Some("Paste"), Some("app.paste"));
+    menu.append_submenu(Some("_Edit"), &edit);
+
+    let help = gio::Menu::new();
+    help.append(Some("About"), Some("app.about"));
+    menu.append_submenu(Some("_Help"), &help);
+
+    app.set_menubar(Some(&menu));
+
+    // Helper closure factory: each placeholder action stamps `text'
+    // into the echo area + queues a redraw.  Same shape the keyboard
+    // handler uses, so the menu feels consistent with the keys.
+    let make_placeholder = |text: &'static str| {
+        let st = state.clone();
+        let ar = area.clone();
+        move |_a: &gio::SimpleAction, _: Option<&glib::Variant>| {
+            let mut s = st.borrow_mut();
+            put_echo_area(&mut s.grid, text);
+            s.last_key = text.to_string();
+            drop(s);
+            ar.queue_draw();
+        }
+    };
+
+    for (name, msg) in [
+        ("save", "menu: Save (Phase 2.B planned)"),
+        ("cut", "menu: Cut (Phase 2.C clipboard planned)"),
+        ("copy", "menu: Copy (Phase 2.C clipboard planned)"),
+        ("paste", "menu: Paste (Phase 2.C clipboard planned)"),
+        ("about", "nemacs-gtk Phase 2.A — native menu bar"),
+    ] {
+        let action = gio::SimpleAction::new(name, None);
+        action.connect_activate(make_placeholder(msg));
+        app.add_action(&action);
+    }
+
+    // Quit closes the window (= triggers GTK's app-shutdown).
+    let quit_action = gio::SimpleAction::new("quit", None);
+    let win = window.clone();
+    quit_action.connect_activate(move |_, _| win.close());
+    app.add_action(&quit_action);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Diagnostic — reproduces the user-reported "void-function:
+    /// window-system" inside the welcome form.  Asserts the form evals
+    /// cleanly so a regression here trips a test, not a runtime
+    /// bootstrap-failed dialog.
+    #[test]
+    fn welcome_buffer_form_evals_cleanly_after_phase_1e_setup() {
+        let mut s = Session::new();
+        let setup = s.eval_to_string(&nelisp_bridge::layer2_setup_form());
+        assert!(!setup.starts_with("ERR "), "layer2 setup failed: {setup}");
+        let display =
+            s.eval_to_string(nelisp_bridge::display_system_setup_form());
+        assert!(!display.starts_with("ERR "), "display setup failed: {display}");
+        let r = s.eval_to_string(welcome_buffer_form());
+        assert!(
+            !r.starts_with("ERR "),
+            "welcome form errored: {r}"
+        );
+    }
 
     #[test]
     fn unquote_printed_strips_outer_quotes() {
