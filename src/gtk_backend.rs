@@ -60,6 +60,12 @@ pub struct MouseEvent {
     pub row: usize,
     pub col: usize,
     pub mods: u32,
+    /// `n_press' from `GestureClick' — 1 = single, 2 = double,
+    /// 3 = triple, etc.  Phase 2.V: elisp uses this to dispatch
+    /// `mouse-double-1' / `mouse-triple-1' instead of the bare
+    /// `mouse-1' for click-count selection.  Always 1 for non-press
+    /// kinds (= release / motion / scroll don't have a press count).
+    pub n_press: u32,
 }
 
 pub struct GtkState {
@@ -165,12 +171,16 @@ fn key_event_to_sexp(ev: KeyEvent) -> Sexp {
 /// raw pixel coords (= what GTK hands the gesture callback) into
 /// 0-based cell `(row, col)' against the current cell metrics.
 /// Coords past the canvas edge clamp to the last valid cell.
+///
+/// `n_press' is the GestureClick click-count (1 / 2 / 3 / ...) for
+/// press events; pass 1 for kinds that don't carry a press count.
 fn push_mouse(
     state: &Rc<RefCell<GtkState>>,
     kind: MouseKind,
     button: u32,
     x: f64,
     y: f64,
+    n_press: u32,
 ) {
     let mut g = state.borrow_mut();
     if g.cell_w <= 0.0 || g.cell_h <= 0.0 {
@@ -186,12 +196,18 @@ fn push_mouse(
         row,
         col,
         mods: 0,
+        n_press,
     });
 }
 
-/// Convert a mouse event to the elisp tuple `(KIND BUTTON ROW COL MODS)`.
-/// KIND is a quoted symbol ('press / 'release / 'scroll-up / 'scroll-down)
-/// so the frontend can `eq'-dispatch.
+/// Convert a mouse event to the elisp tuple
+/// `(KIND BUTTON ROW COL MODS N-PRESS)'.
+/// KIND is a quoted symbol ('press / 'release / 'motion / 'scroll-up /
+/// 'scroll-down) so the frontend can `eq'-dispatch.
+/// N-PRESS (Phase 2.V) is the click-count from `GestureClick' — 1 for
+/// single click, 2 for double, 3 for triple — so the frontend can
+/// route to `mouse-double-1' / `mouse-triple-1' bindings.  Always 1
+/// for non-press kinds.
 fn mouse_event_to_sexp(ev: MouseEvent) -> Sexp {
     let kind = match ev.kind {
         MouseKind::Press => "press",
@@ -206,6 +222,7 @@ fn mouse_event_to_sexp(ev: MouseEvent) -> Sexp {
         Sexp::Int(ev.row as i64),
         Sexp::Int(ev.col as i64),
         Sexp::Int(ev.mods as i64),
+        Sexp::Int(ev.n_press as i64),
     ])
 }
 
@@ -1051,10 +1068,10 @@ fn build_window(
     let click = gtk::GestureClick::new();
     click.set_button(0);
     let st_for_press = state.clone();
-    click.connect_pressed(move |gesture, _n_press, x, y| {
+    click.connect_pressed(move |gesture, n_press, x, y| {
         let button = gesture.current_button();
         st_for_press.borrow_mut().mouse_pressed_button = Some(button);
-        push_mouse(&st_for_press, MouseKind::Press, button, x, y);
+        push_mouse(&st_for_press, MouseKind::Press, button, x, y, n_press as u32);
     });
     let st_for_release = state.clone();
     click.connect_released(move |gesture, _n_press, x, y| {
@@ -1069,7 +1086,7 @@ fn build_window(
                 g.mouse_pressed_button = None;
             }
         }
-        push_mouse(&st_for_release, MouseKind::Release, button, x, y);
+        push_mouse(&st_for_release, MouseKind::Release, button, x, y, 1);
     });
     area.add_controller(click);
 
@@ -1082,7 +1099,7 @@ fn build_window(
     motion_ctl.connect_motion(move |_c, x, y| {
         let held = st_for_motion.borrow().mouse_pressed_button;
         if let Some(button) = held {
-            push_mouse(&st_for_motion, MouseKind::Motion, button, x, y);
+            push_mouse(&st_for_motion, MouseKind::Motion, button, x, y, 1);
         }
     });
     area.add_controller(motion_ctl);
@@ -1098,7 +1115,7 @@ fn build_window(
         } else {
             return glib::Propagation::Proceed;
         };
-        let ev = MouseEvent { kind, button: 0, row: 0, col: 0, mods: 0 };
+        let ev = MouseEvent { kind, button: 0, row: 0, col: 0, mods: 0, n_press: 1 };
         st_for_scroll.borrow_mut().mouse_event_queue.push_back(ev);
         glib::Propagation::Proceed
     });
