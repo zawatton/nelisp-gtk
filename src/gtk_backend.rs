@@ -355,6 +355,20 @@ pub fn register_all(env: &mut Env, state: Rc<RefCell<GtkState>>) {
         });
     }
 
+    // ----- nelisp-gtk-iconify-frame () -----
+    // Phase 2.BI — minimize the GTK ApplicationWindow.  Returns nil
+    // on success / when the window isn't built yet (= silent no-op).
+    {
+        let st = state.clone();
+        env.register_extern_builtin("nelisp-gtk-iconify-frame", move |_args, _env| {
+            let g = st.borrow();
+            if let Some(w) = &g.window {
+                w.minimize();
+            }
+            Ok(Sexp::Nil)
+        });
+    }
+
     // ----- nelisp-gtk-set-region START-ROW START-COL END-ROW END-COL -----
     // Phase 2.BH — set the region-highlight rectangle (= the
     // [mark .. point] span).  When all four args are 0, the region
