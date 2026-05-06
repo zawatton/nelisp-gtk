@@ -543,9 +543,14 @@ pub fn register_all(env: &mut Env, state: Rc<RefCell<GtkState>>) {
                 }
             }
 
-            // --- 5) Cursor row/col from point + scroll ---
+            // --- 5) Cursor row/col from point + auto-scroll ---
             // Walk content[0..point-1], count newlines for buf-row and
-            // distance from last \n for col.  Then subtract scroll.
+            // distance from last \n for col.  Phase 3.L: also auto-
+            // adjust scroll so the cursor stays in [scroll, scroll+
+            // buf_end).  This replaces the elisp `--ensure-cursor-
+            // visible' which walked the buffer per keystroke, the
+            // last big interpreter-cost item in the typing path.
+            let mut new_scroll = scroll;
             if point >= 1 {
                 let target = (point as usize).saturating_sub(1).min(content.len());
                 let mut buf_row = 0usize;
@@ -555,15 +560,19 @@ pub fn register_all(env: &mut Env, state: Rc<RefCell<GtkState>>) {
                         buf_row += 1;
                         col = 0;
                     } else {
-                        // ASCII fast path; multi-byte chars need .chars()
-                        // walk for accurate column.  For now treat each
-                        // byte as a column unit — matches elisp's
-                        // `--cursor-row-col' which counts chars; UTF-8
-                        // multi-byte is rare in code.
+                        // ASCII fast path; UTF-8 multi-byte chars
+                        // count as multiple columns here (rare in
+                        // code; full handling deferred).
                         col += 1;
                     }
                 }
-                let screen_row = buf_row.checked_sub(scroll);
+                // Auto-scroll to keep cursor visible.
+                if buf_row < new_scroll {
+                    new_scroll = buf_row;
+                } else if buf_end > 0 && buf_row >= new_scroll + buf_end {
+                    new_scroll = buf_row + 1 - buf_end;
+                }
+                let screen_row = buf_row.checked_sub(new_scroll);
                 if let Some(sr) = screen_row {
                     if sr < buf_end {
                         g.cursor = Some((sr, col.min(cols.saturating_sub(1))));
@@ -575,12 +584,66 @@ pub fn register_all(env: &mut Env, state: Rc<RefCell<GtkState>>) {
                 }
             }
 
+            // --- 5b) If new_scroll differs from scroll, repaint the
+            // buffer area at the new scroll value.  In practice this
+            // is rare (only when the user crossed a screen edge), so
+            // the cost of a fresh layout pass on those frames is OK.
+            if new_scroll != scroll {
+                // Re-clear + re-walk lines with new scroll.
+                g.grid.clear_all();
+                let mut row = 0usize;
+                let mut line_idx = 0usize;
+                let mut line_start = 0usize;
+                let mut i = 0usize;
+                while i <= bytes.len() && row < buf_end {
+                    let at_end = i == bytes.len();
+                    let is_nl = !at_end && bytes[i] == b'\n';
+                    if is_nl || at_end {
+                        if line_idx >= new_scroll {
+                            let line = std::str::from_utf8(&bytes[line_start..i])
+                                .unwrap_or("");
+                            let mut col = 0usize;
+                            for ch in line.chars() {
+                                if col >= cols { break; }
+                                g.grid.put(row, col, ch);
+                                col += 1;
+                            }
+                            row += 1;
+                        }
+                        line_idx += 1;
+                        line_start = i + 1;
+                    }
+                    i += 1;
+                }
+                // Re-paint mode-line + echo since clear_all wiped them.
+                if buf_end < g.grid.rows {
+                    let mut col = 0usize;
+                    for ch in mode_line.chars() {
+                        if col >= cols { break; }
+                        g.grid.put(buf_end, col, ch);
+                        col += 1;
+                    }
+                }
+                let echo_row = g.grid.rows.saturating_sub(1);
+                if echo_row > buf_end {
+                    let mut col = 0usize;
+                    for ch in echo.chars() {
+                        if col >= cols { break; }
+                        g.grid.put(echo_row, col, ch);
+                        col += 1;
+                    }
+                }
+            }
+
             // --- 6) Queue a single redraw ---
             if let Some(area) = &g.area {
                 area.queue_draw();
             }
 
-            Ok(Sexp::Nil)
+            // Return the new scroll value as an Int so elisp can
+            // update its `--scroll-offset' defvar without re-walking
+            // the buffer in `--ensure-cursor-visible'.
+            Ok(Sexp::Int(new_scroll as i64))
         });
     }
 
