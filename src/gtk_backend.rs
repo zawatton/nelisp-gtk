@@ -88,6 +88,13 @@ pub struct GtkState {
     /// span is inclusive on the start cell + exclusive on the end
     /// cell.  None = no region (= no highlight overlay rendered).
     pub region: Option<(usize, usize, usize, usize)>,
+    /// Phase 2.BL — generic highlight overlays.  Each entry is
+    /// (start_row, start_col, end_row, end_col, r, g, b, a).  Painted
+    /// after the region overlay but before text + cursor on each
+    /// frame, in list order so later entries overlay earlier ones.
+    /// The elisp frontend rebuilds + replaces this list each paint
+    /// cycle (= isearch matches, paren-match, syntax overlays, etc.).
+    pub highlights: Vec<(usize, usize, usize, usize, f32, f32, f32, f32)>,
     pub mode_line_row: Option<usize>,
     pub key_queue: VecDeque<KeyEvent>,
     pub menu_event_queue: VecDeque<String>,
@@ -119,6 +126,7 @@ impl GtkState {
             font: FONT.to_string(),
             cursor: None,
             region: None,
+            highlights: Vec::new(),
             mode_line_row: None,
             key_queue: VecDeque::new(),
             menu_event_queue: VecDeque::new(),
@@ -351,6 +359,49 @@ pub fn register_all(env: &mut Env, state: Rc<RefCell<GtkState>>) {
             if let Some(area) = &g.area {
                 area.queue_draw();
             }
+            Ok(Sexp::Nil)
+        });
+    }
+
+    // ----- nelisp-gtk-set-highlights LIST -----
+    // Phase 2.BL — replace the highlight overlay list.  Input is a
+    // proper list whose each element is itself a list of 8 ints:
+    // (SR SC ER EC R G B A) where R/G/B/A are 0..255 colour bytes.
+    // Same wrapping semantics as the region overlay (Phase 2.BH):
+    // sr == er → single-row span sc..ec; multi-row → first-row
+    // trailing + middle full + last-row leading rectangles.
+    {
+        let st = state.clone();
+        env.register_extern_builtin("nelisp-gtk-set-highlights", move |args, _env| {
+            let list = args.get(0).cloned().unwrap_or(Sexp::Nil);
+            let mut out: Vec<(usize, usize, usize, usize, f32, f32, f32, f32)> = Vec::new();
+            for entry in sexp_list_iter(&list) {
+                let parts = sexp_list_iter(&entry);
+                if parts.len() != 8 {
+                    continue;
+                }
+                let ints: Vec<i64> = parts
+                    .iter()
+                    .map(|s| match s {
+                        Sexp::Int(n) => *n,
+                        _ => -1,
+                    })
+                    .collect();
+                if ints.iter().any(|n| *n < 0) {
+                    continue;
+                }
+                let sr = ints[0] as usize;
+                let sc = ints[1] as usize;
+                let er = ints[2] as usize;
+                let ec = ints[3] as usize;
+                let r = (ints[4].min(255)) as f32 / 255.0;
+                let g = (ints[5].min(255)) as f32 / 255.0;
+                let b = (ints[6].min(255)) as f32 / 255.0;
+                let a = (ints[7].min(255)) as f32 / 255.0;
+                out.push((sr, sc, er, ec, r, g, b, a));
+            }
+            let mut g = st.borrow_mut();
+            g.highlights = out;
             Ok(Sexp::Nil)
         });
     }
@@ -1124,6 +1175,59 @@ fn build_window(
             cr.set_source_rgb(0.18, 0.18, 0.22);
             cr.rectangle(0.0, ml_row as f64 * g.cell_h, canvas_w, g.cell_h);
             let _ = cr.fill();
+        }
+
+        // Phase 2.BL — generic highlight overlays (= isearch matches,
+        // paren-match, etc.).  Painted before the region so the
+        // canonical region highlight (= active selection) stays
+        // visually dominant when both apply to the same cells.
+        let cols = g.grid.cols;
+        for &(sr, sc, er, ec, r, g_col, b, a) in g.highlights.iter() {
+            cr.set_source_rgba(r as f64, g_col as f64, b as f64, a as f64);
+            if sr == er {
+                let lo = sc.min(ec);
+                let hi = sc.max(ec);
+                if hi > lo {
+                    cr.rectangle(
+                        lo as f64 * g.cell_w,
+                        sr as f64 * g.cell_h,
+                        (hi - lo) as f64 * g.cell_w,
+                        g.cell_h,
+                    );
+                    let _ = cr.fill();
+                }
+            } else {
+                let (sr2, sc2, er2, ec2) = if sr < er || (sr == er && sc < ec) {
+                    (sr, sc, er, ec)
+                } else {
+                    (er, ec, sr, sc)
+                };
+                cr.rectangle(
+                    sc2 as f64 * g.cell_w,
+                    sr2 as f64 * g.cell_h,
+                    (cols.saturating_sub(sc2)) as f64 * g.cell_w,
+                    g.cell_h,
+                );
+                let _ = cr.fill();
+                if er2 > sr2 + 1 {
+                    cr.rectangle(
+                        0.0,
+                        (sr2 + 1) as f64 * g.cell_h,
+                        cols as f64 * g.cell_w,
+                        (er2 - sr2 - 1) as f64 * g.cell_h,
+                    );
+                    let _ = cr.fill();
+                }
+                if ec2 > 0 {
+                    cr.rectangle(
+                        0.0,
+                        er2 as f64 * g.cell_h,
+                        ec2 as f64 * g.cell_w,
+                        g.cell_h,
+                    );
+                    let _ = cr.fill();
+                }
+            }
         }
 
         // Phase 2.BH — region highlight (= translucent blue overlay
