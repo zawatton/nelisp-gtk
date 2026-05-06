@@ -102,6 +102,12 @@ pub struct GtkState {
     /// recolour individual glyphs.  Cells not covered by any span
     /// fall back to the default black (or mode-line white).
     pub color_spans: Vec<(usize, usize, usize, usize, u8, u8, u8)>,
+    /// Phase 3.N — incremental buffer cache.  Rust mirrors the active
+    /// elisp buffer's text here so paint-frame-simple-cached can
+    /// render without copying ~thousands of bytes per keystroke.
+    /// Maintained by `nelisp-gtk-buffer-set' (= full set, called on
+    /// switch) + `nelisp-gtk-buffer-edit' (= delta, called per edit).
+    pub buffer_cache: String,
     pub mode_line_row: Option<usize>,
     pub key_queue: VecDeque<KeyEvent>,
     pub menu_event_queue: VecDeque<String>,
@@ -135,6 +141,7 @@ impl GtkState {
             region: None,
             highlights: Vec::new(),
             color_spans: Vec::new(),
+            buffer_cache: String::new(),
             mode_line_row: None,
             key_queue: VecDeque::new(),
             menu_event_queue: VecDeque::new(),
@@ -643,6 +650,175 @@ pub fn register_all(env: &mut Env, state: Rc<RefCell<GtkState>>) {
             // Return the new scroll value as an Int so elisp can
             // update its `--scroll-offset' defvar without re-walking
             // the buffer in `--ensure-cursor-visible'.
+            Ok(Sexp::Int(new_scroll as i64))
+        });
+    }
+
+    // ----- nelisp-gtk-buffer-set CONTENT -----
+    // Phase 3.N — replace the Rust-side buffer cache.  Called by
+    // elisp on buffer switch / first paint of a new buffer.
+    {
+        let st = state.clone();
+        env.register_extern_builtin("nelisp-gtk-buffer-set", move |args, _env| {
+            let content = want_string(args, 0, "nelisp-gtk-buffer-set")?;
+            let mut g = st.borrow_mut();
+            g.buffer_cache = content;
+            Ok(Sexp::Nil)
+        });
+    }
+
+    // ----- nelisp-gtk-buffer-edit POS DEL-LEN INSERT -----
+    // Phase 3.N — incremental edit on the Rust-side cache.  POS is
+    // 1-based (= elisp point convention).  DEL-LEN bytes are removed
+    // starting at POS-1, then INSERT bytes are spliced in at POS-1.
+    // Either side may be 0 / "" for pure insertions / deletions.
+    //
+    // The cache string is treated as bytes; UTF-8 multibyte chars
+    // get split if POS / DEL-LEN don't fall on char boundaries (=
+    // matches the substrate's gap-buffer byte semantics).
+    {
+        let st = state.clone();
+        env.register_extern_builtin("nelisp-gtk-buffer-edit", move |args, _env| {
+            let pos = want_int(args, 0, "nelisp-gtk-buffer-edit")? as usize;
+            let del_len = want_int(args, 1, "nelisp-gtk-buffer-edit")? as usize;
+            let ins = want_string(args, 2, "nelisp-gtk-buffer-edit")?;
+            let mut g = st.borrow_mut();
+            // Convert 1-based pos to 0-based byte offset.
+            let start = pos.saturating_sub(1);
+            let total = g.buffer_cache.len();
+            let start = start.min(total);
+            let end = (start + del_len).min(total);
+            // Splice: replace [start..end) with ins.
+            let mut new_cache = String::with_capacity(total - (end - start) + ins.len());
+            new_cache.push_str(&g.buffer_cache[..start]);
+            new_cache.push_str(&ins);
+            new_cache.push_str(&g.buffer_cache[end..]);
+            g.buffer_cache = new_cache;
+            Ok(Sexp::Nil)
+        });
+    }
+
+    // ----- nelisp-gtk-paint-frame-cached SCROLL POINT MODE-LINE ECHO -----
+    // Phase 3.N — paint using the cached buffer content.  Saves the
+    // ~thousands-of-bytes round-trip-per-keystroke that
+    // `paint-frame-simple' was paying.  Returns the auto-adjusted
+    // scroll-offset like its sibling.
+    //
+    // ARGS:
+    //   0: scroll-int
+    //   1: point-int (1-based)
+    //   2: mode-line-string
+    //   3: echo-area-string
+    {
+        let st = state.clone();
+        env.register_extern_builtin("nelisp-gtk-paint-frame-cached", move |args, _env| {
+            let scroll = want_int(args, 0, "nelisp-gtk-paint-frame-cached")? as usize;
+            let point = want_int(args, 1, "nelisp-gtk-paint-frame-cached")? as i64;
+            let mode_line = want_string(args, 2, "nelisp-gtk-paint-frame-cached")?;
+            let echo = want_string(args, 3, "nelisp-gtk-paint-frame-cached")?;
+
+            let mut g = st.borrow_mut();
+            let cols = g.grid.cols;
+            let rows_total = g.grid.rows;
+            let buf_end = g.mode_line_row.unwrap_or(rows_total.saturating_sub(2));
+
+            // Take the cache by reference, walk + paint.
+            // We can't borrow `g.buffer_cache` and `g.grid` at the
+            // same time mutably, so swap out the cache temporarily.
+            let cache = std::mem::take(&mut g.buffer_cache);
+            let bytes = cache.as_bytes();
+
+            // Compute cursor row + auto-adjust scroll first (= the
+            // scroll change may shift what we paint).
+            let mut new_scroll = scroll;
+            let mut cursor_row = 0usize;
+            let mut cursor_col = 0usize;
+            if point >= 1 {
+                let target = (point as usize).saturating_sub(1).min(bytes.len());
+                let mut buf_row = 0usize;
+                let mut col = 0usize;
+                for &b in &bytes[..target] {
+                    if b == b'\n' {
+                        buf_row += 1;
+                        col = 0;
+                    } else {
+                        col += 1;
+                    }
+                }
+                cursor_row = buf_row;
+                cursor_col = col;
+                if buf_row < new_scroll {
+                    new_scroll = buf_row;
+                } else if buf_end > 0 && buf_row >= new_scroll + buf_end {
+                    new_scroll = buf_row + 1 - buf_end;
+                }
+            }
+
+            g.grid.clear_all();
+
+            // Paint buffer area.
+            let mut row = 0usize;
+            let mut line_idx = 0usize;
+            let mut line_start = 0usize;
+            let mut i = 0usize;
+            while i <= bytes.len() && row < buf_end {
+                let at_end = i == bytes.len();
+                let is_nl = !at_end && bytes[i] == b'\n';
+                if is_nl || at_end {
+                    if line_idx >= new_scroll {
+                        let line = std::str::from_utf8(&bytes[line_start..i])
+                            .unwrap_or("");
+                        let mut col = 0usize;
+                        for ch in line.chars() {
+                            if col >= cols { break; }
+                            g.grid.put(row, col, ch);
+                            col += 1;
+                        }
+                        row += 1;
+                    }
+                    line_idx += 1;
+                    line_start = i + 1;
+                }
+                i += 1;
+            }
+
+            // Mode-line row.
+            if buf_end < g.grid.rows {
+                let mut col = 0usize;
+                for ch in mode_line.chars() {
+                    if col >= cols { break; }
+                    g.grid.put(buf_end, col, ch);
+                    col += 1;
+                }
+            }
+            // Echo row.
+            let echo_row = g.grid.rows.saturating_sub(1);
+            if echo_row > buf_end {
+                let mut col = 0usize;
+                for ch in echo.chars() {
+                    if col >= cols { break; }
+                    g.grid.put(echo_row, col, ch);
+                    col += 1;
+                }
+            }
+
+            // Cursor.
+            if let Some(sr) = cursor_row.checked_sub(new_scroll) {
+                if sr < buf_end {
+                    g.cursor = Some((sr, cursor_col.min(cols.saturating_sub(1))));
+                } else {
+                    g.cursor = None;
+                }
+            } else {
+                g.cursor = None;
+            }
+
+            // Restore the cache (we swapped it out earlier).
+            g.buffer_cache = cache;
+
+            if let Some(area) = &g.area {
+                area.queue_draw();
+            }
             Ok(Sexp::Int(new_scroll as i64))
         });
     }
