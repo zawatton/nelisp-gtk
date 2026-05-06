@@ -698,6 +698,33 @@ pub fn register_all(env: &mut Env, state: Rc<RefCell<GtkState>>) {
         });
     }
 
+    // ----- nelisp-gtk-buffer-line-number-at POS -----
+    // Phase 3.O — count newlines in `buffer_cache[..pos-1]' so the
+    // mode-line `Lx' read can skip the elisp polyfill (= which calls
+    // `(buffer-substring (point-min) point)' + walks bytes through
+    // the NeLisp interpreter, an O(point) cost per repaint).  POS is
+    // 1-based; a POS at or before 1 returns 1.  Returns nil if POS
+    // is not an integer (= caller should fall back to the polyfill).
+    {
+        let st = state.clone();
+        env.register_extern_builtin("nelisp-gtk-buffer-line-number-at", move |args, _env| {
+            let pos = want_int(args, 0, "nelisp-gtk-buffer-line-number-at")? as i64;
+            if pos <= 1 {
+                return Ok(Sexp::Int(1));
+            }
+            let g = st.borrow();
+            let bytes = g.buffer_cache.as_bytes();
+            let target = (pos as usize).saturating_sub(1).min(bytes.len());
+            let mut line = 1i64;
+            for &b in &bytes[..target] {
+                if b == b'\n' {
+                    line += 1;
+                }
+            }
+            Ok(Sexp::Int(line))
+        });
+    }
+
     // ----- nelisp-gtk-paint-frame-cached SCROLL POINT MODE-LINE ECHO -----
     // Phase 3.N — paint using the cached buffer content.  Saves the
     // ~thousands-of-bytes round-trip-per-keystroke that
