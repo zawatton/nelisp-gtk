@@ -262,6 +262,27 @@ pub fn register_all(env: &mut Env, state: Rc<RefCell<GtkState>>) {
         });
     }
 
+    // ----- nelisp-gtk-grid-put-substr (row col str) -----
+    //
+    // Like `nelisp-gtk-grid-put-row' but writes STR starting at COL
+    // *without* clearing the rest of the row.  Used by Phase 2.AW
+    // vertical-window-split paint to compose multi-column rows
+    // (each window paints its own (col..col+cols) band into the row).
+    // Out-of-bounds row / col are clamped (= no-op).
+    {
+        let st = state.clone();
+        env.register_extern_builtin("nelisp-gtk-grid-put-substr", move |args, _env| {
+            let row = want_int(args, 0, "nelisp-gtk-grid-put-substr")? as usize;
+            let col = want_int(args, 1, "nelisp-gtk-grid-put-substr")? as usize;
+            let s = want_string(args, 2, "nelisp-gtk-grid-put-substr")?;
+            let mut g = st.borrow_mut();
+            if row < g.grid.rows && col < g.grid.cols {
+                g.grid.put_str(row, col, &s);
+            }
+            Ok(Sexp::Nil)
+        });
+    }
+
     // ----- nelisp-gtk-grid-clear () -----
     {
         let st = state.clone();
