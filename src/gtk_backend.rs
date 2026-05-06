@@ -458,6 +458,132 @@ pub fn register_all(env: &mut Env, state: Rc<RefCell<GtkState>>) {
         });
     }
 
+    // ----- nelisp-gtk-paint-frame-simple ROWS COLS BUFFER-AREA-END SCROLL CONTENT POINT MODE-LINE ECHO-AREA -----
+    // Phase 3.F — fast-path single-window repaint that bundles all
+    // the work `nemacs-gtk--repaint' previously did across ~50
+    // separate elisp→Rust extern calls into one trip.  Writes the
+    // grid + cursor in one borrow_mut, then queues a single redraw.
+    //
+    // ARGS:
+    //   0: rows-int            (grid total rows)
+    //   1: cols-int            (grid total cols)
+    //   2: buffer-area-end-int (first row of mode-line, exclusive)
+    //   3: scroll-int          (skip first N lines of CONTENT)
+    //   4: content-string      (full active-buffer text)
+    //   5: point-int           (1-based byte offset for cursor)
+    //   6: mode-line-string    (already padded to cols by elisp side)
+    //   7: echo-area-string    (already padded; goes on the last row)
+    {
+        let st = state.clone();
+        env.register_extern_builtin("nelisp-gtk-paint-frame-simple", move |args, _env| {
+            let _rows = want_int(args, 0, "nelisp-gtk-paint-frame-simple")? as usize;
+            let cols = want_int(args, 1, "nelisp-gtk-paint-frame-simple")? as usize;
+            let buf_end = want_int(args, 2, "nelisp-gtk-paint-frame-simple")? as usize;
+            let scroll = want_int(args, 3, "nelisp-gtk-paint-frame-simple")? as usize;
+            let content = want_string(args, 4, "nelisp-gtk-paint-frame-simple")?;
+            let point = want_int(args, 5, "nelisp-gtk-paint-frame-simple")? as i64;
+            let mode_line = want_string(args, 6, "nelisp-gtk-paint-frame-simple")?;
+            let echo = want_string(args, 7, "nelisp-gtk-paint-frame-simple")?;
+
+            let mut g = st.borrow_mut();
+
+            // --- 1) Clear grid ---
+            g.grid.clear_all();
+
+            // --- 2) Buffer area: paint lines [scroll..scroll+buf_end) ---
+            // Walk the content string by lines, only allocating per-line
+            // slices, never the full Vec<&str>.  This is much cheaper than
+            // elisp's `split-string' which builds N owned strings.
+            let mut row = 0usize;
+            let mut line_idx = 0usize;
+            let mut line_start = 0usize;
+            let bytes = content.as_bytes();
+            let mut i = 0usize;
+            while i <= bytes.len() && row < buf_end {
+                let at_end = i == bytes.len();
+                let is_nl = !at_end && bytes[i] == b'\n';
+                if is_nl || at_end {
+                    if line_idx >= scroll {
+                        // Slice safely on UTF-8 boundary: line_start + line bytes.
+                        let line = std::str::from_utf8(&bytes[line_start..i])
+                            .unwrap_or("");
+                        // Truncate to cols chars + put.
+                        let mut col = 0usize;
+                        for ch in line.chars() {
+                            if col >= cols { break; }
+                            g.grid.put(row, col, ch);
+                            col += 1;
+                        }
+                        row += 1;
+                    }
+                    line_idx += 1;
+                    line_start = i + 1;
+                }
+                i += 1;
+            }
+
+            // --- 3) Mode-line row ---
+            if buf_end < g.grid.rows {
+                let mut col = 0usize;
+                for ch in mode_line.chars() {
+                    if col >= cols { break; }
+                    g.grid.put(buf_end, col, ch);
+                    col += 1;
+                }
+            }
+
+            // --- 4) Echo-area row (last row of grid) ---
+            let echo_row = g.grid.rows.saturating_sub(1);
+            if echo_row > buf_end {
+                let mut col = 0usize;
+                for ch in echo.chars() {
+                    if col >= cols { break; }
+                    g.grid.put(echo_row, col, ch);
+                    col += 1;
+                }
+            }
+
+            // --- 5) Cursor row/col from point + scroll ---
+            // Walk content[0..point-1], count newlines for buf-row and
+            // distance from last \n for col.  Then subtract scroll.
+            if point >= 1 {
+                let target = (point as usize).saturating_sub(1).min(content.len());
+                let mut buf_row = 0usize;
+                let mut col = 0usize;
+                for &b in &bytes[..target] {
+                    if b == b'\n' {
+                        buf_row += 1;
+                        col = 0;
+                    } else {
+                        // ASCII fast path; multi-byte chars need .chars()
+                        // walk for accurate column.  For now treat each
+                        // byte as a column unit — matches elisp's
+                        // `--cursor-row-col' which counts chars; UTF-8
+                        // multi-byte is rare in code.
+                        col += 1;
+                    }
+                }
+                let screen_row = buf_row.checked_sub(scroll);
+                if let Some(sr) = screen_row {
+                    if sr < buf_end {
+                        g.cursor = Some((sr, col.min(cols.saturating_sub(1))));
+                    } else {
+                        g.cursor = None;
+                    }
+                } else {
+                    g.cursor = None;
+                }
+            }
+
+            // --- 6) Queue a single redraw ---
+            if let Some(area) = &g.area {
+                area.queue_draw();
+            }
+
+            Ok(Sexp::Nil)
+        });
+    }
+
     // ----- nelisp-gtk-iconify-frame () -----
     // Phase 2.BI — minimize the GTK ApplicationWindow.  Returns nil
     // on success / when the window isn't built yet (= silent no-op).

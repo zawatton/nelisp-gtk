@@ -37,4 +37,14 @@ impl CharGrid {
     pub fn get(&self, row: usize, col: usize) -> char {
         self.cells[row * self.cols + col]
     }
+
+    /// Wipe the whole grid back to blanks.  Used by the fast-path
+    /// `paint-frame-simple' extern (= Phase 3.F) which clears + repaints
+    /// in a single call to avoid round-tripping through the elisp
+    /// interpreter for each row.
+    pub fn clear_all(&mut self) {
+        for cell in self.cells.iter_mut() {
+            *cell = ' ';
+        }
+    }
 }
