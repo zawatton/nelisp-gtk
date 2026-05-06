@@ -95,6 +95,13 @@ pub struct GtkState {
     /// The elisp frontend rebuilds + replaces this list each paint
     /// cycle (= isearch matches, paren-match, syntax overlays, etc.).
     pub highlights: Vec<(usize, usize, usize, usize, f32, f32, f32, f32)>,
+    /// Phase 3.B — per-character foreground colour overrides.  Each
+    /// entry is (start_row, start_col, end_row, end_col, r, g, b)
+    /// with r/g/b as 0..255 bytes.  The draw callback flattens these
+    /// into a per-cell lookup at paint time so font-lock spans can
+    /// recolour individual glyphs.  Cells not covered by any span
+    /// fall back to the default black (or mode-line white).
+    pub color_spans: Vec<(usize, usize, usize, usize, u8, u8, u8)>,
     pub mode_line_row: Option<usize>,
     pub key_queue: VecDeque<KeyEvent>,
     pub menu_event_queue: VecDeque<String>,
@@ -127,6 +134,7 @@ impl GtkState {
             cursor: None,
             region: None,
             highlights: Vec::new(),
+            color_spans: Vec::new(),
             mode_line_row: None,
             key_queue: VecDeque::new(),
             menu_event_queue: VecDeque::new(),
@@ -402,6 +410,50 @@ pub fn register_all(env: &mut Env, state: Rc<RefCell<GtkState>>) {
             }
             let mut g = st.borrow_mut();
             g.highlights = out;
+            Ok(Sexp::Nil)
+        });
+    }
+
+    // ----- nelisp-gtk-set-color-spans LIST -----
+    // Phase 3.B — replace the per-glyph foreground colour list.
+    // LIST = proper list whose each element is `(SR SC ER EC R G B)'
+    // — 7 ints with R/G/B as 0..255.  Same multi-row wrapping
+    // semantics as `set-region' (Phase 2.BH): sr == er → single
+    // row span; else first-row trailing + middle full + last-row
+    // leading.  Malformed entries (= != 7 ints / negatives) are
+    // silently skipped.
+    {
+        let st = state.clone();
+        env.register_extern_builtin("nelisp-gtk-set-color-spans", move |args, _env| {
+            let list = args.get(0).cloned().unwrap_or(Sexp::Nil);
+            let mut out: Vec<(usize, usize, usize, usize, u8, u8, u8)> = Vec::new();
+            for entry in sexp_list_iter(&list) {
+                let parts = sexp_list_iter(&entry);
+                if parts.len() != 7 {
+                    continue;
+                }
+                let ints: Vec<i64> = parts
+                    .iter()
+                    .map(|s| match s {
+                        Sexp::Int(n) => *n,
+                        _ => -1,
+                    })
+                    .collect();
+                if ints.iter().any(|n| *n < 0) {
+                    continue;
+                }
+                out.push((
+                    ints[0] as usize,
+                    ints[1] as usize,
+                    ints[2] as usize,
+                    ints[3] as usize,
+                    ints[4].min(255) as u8,
+                    ints[5].min(255) as u8,
+                    ints[6].min(255) as u8,
+                ));
+            }
+            let mut g = st.borrow_mut();
+            g.color_spans = out;
             Ok(Sexp::Nil)
         });
     }
@@ -1300,17 +1352,66 @@ fn build_window(
             let _ = cr.fill();
         }
 
-        let mut buf = [0u8; 4];
-        for row in 0..g.grid.rows {
-            if Some(row) == g.mode_line_row {
-                cr.set_source_rgb(0.94, 0.94, 0.94);
+        // Phase 3.B — flatten color_spans into a per-cell colour
+        // grid so the text loop's per-cell lookup is O(1).  Later
+        // spans overwrite earlier ones (= matches the elisp side's
+        // `font-lock-keywords' first-match priority when the elisp
+        // sender orders them low-to-high).
+        let rows = g.grid.rows;
+        let cols_n = g.grid.cols;
+        let mut cell_color: Vec<Option<(u8, u8, u8)>> = vec![None; rows * cols_n];
+        for &(sr, sc, er, ec, r, gc, b) in g.color_spans.iter() {
+            if sr == er {
+                let lo = sc.min(ec);
+                let hi = sc.max(ec).min(cols_n);
+                if sr < rows {
+                    for c in lo..hi {
+                        cell_color[sr * cols_n + c] = Some((r, gc, b));
+                    }
+                }
             } else {
-                cr.set_source_rgb(0.0, 0.0, 0.0);
+                let (sr2, sc2, er2, ec2) = if sr < er || (sr == er && sc < ec) {
+                    (sr, sc, er, ec)
+                } else {
+                    (er, ec, sr, sc)
+                };
+                if sr2 < rows {
+                    for c in sc2..cols_n {
+                        cell_color[sr2 * cols_n + c] = Some((r, gc, b));
+                    }
+                }
+                for rr in (sr2 + 1)..er2.min(rows) {
+                    for c in 0..cols_n {
+                        cell_color[rr * cols_n + c] = Some((r, gc, b));
+                    }
+                }
+                if er2 < rows {
+                    for c in 0..ec2.min(cols_n) {
+                        cell_color[er2 * cols_n + c] = Some((r, gc, b));
+                    }
+                }
             }
-            for col in 0..g.grid.cols {
+        }
+
+        let mut buf = [0u8; 4];
+        for row in 0..rows {
+            for col in 0..cols_n {
                 let ch = g.grid.get(row, col);
                 if ch == ' ' {
                     continue;
+                }
+                // Pick foreground colour: mode-line row wins, then
+                // any explicit span override, then default black.
+                if Some(row) == g.mode_line_row {
+                    cr.set_source_rgb(0.94, 0.94, 0.94);
+                } else if let Some((r, gc, b)) = cell_color[row * cols_n + col] {
+                    cr.set_source_rgb(
+                        r as f64 / 255.0,
+                        gc as f64 / 255.0,
+                        b as f64 / 255.0,
+                    );
+                } else {
+                    cr.set_source_rgb(0.0, 0.0, 0.0);
                 }
                 layout.set_text(ch.encode_utf8(&mut buf));
                 cr.move_to(col as f64 * g.cell_w, row as f64 * g.cell_h);
