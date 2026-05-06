@@ -1478,70 +1478,104 @@ fn build_window(
             let _ = cr.fill();
         }
 
-        // Phase 3.B — flatten color_spans into a per-cell colour
-        // grid so the text loop's per-cell lookup is O(1).  Later
-        // spans overwrite earlier ones (= matches the elisp side's
-        // `font-lock-keywords' first-match priority when the elisp
-        // sender orders them low-to-high).
         let rows = g.grid.rows;
         let cols_n = g.grid.cols;
-        let mut cell_color: Vec<Option<(u8, u8, u8)>> = vec![None; rows * cols_n];
-        for &(sr, sc, er, ec, r, gc, b) in g.color_spans.iter() {
-            if sr == er {
-                let lo = sc.min(ec);
-                let hi = sc.max(ec).min(cols_n);
-                if sr < rows {
-                    for c in lo..hi {
-                        cell_color[sr * cols_n + c] = Some((r, gc, b));
-                    }
-                }
-            } else {
-                let (sr2, sc2, er2, ec2) = if sr < er || (sr == er && sc < ec) {
-                    (sr, sc, er, ec)
-                } else {
-                    (er, ec, sr, sc)
-                };
-                if sr2 < rows {
-                    for c in sc2..cols_n {
-                        cell_color[sr2 * cols_n + c] = Some((r, gc, b));
-                    }
-                }
-                for rr in (sr2 + 1)..er2.min(rows) {
-                    for c in 0..cols_n {
-                        cell_color[rr * cols_n + c] = Some((r, gc, b));
-                    }
-                }
-                if er2 < rows {
-                    for c in 0..ec2.min(cols_n) {
-                        cell_color[er2 * cols_n + c] = Some((r, gc, b));
-                    }
-                }
-            }
-        }
+        let has_color_spans = !g.color_spans.is_empty();
 
         let mut buf = [0u8; 4];
-        for row in 0..rows {
-            for col in 0..cols_n {
-                let ch = g.grid.get(row, col);
-                if ch == ' ' {
-                    continue;
-                }
-                // Pick foreground colour: mode-line row wins, then
-                // any explicit span override, then default black.
+
+        if !has_color_spans {
+            // Phase 3.I fast path: when no per-cell color overrides are
+            // active (= the default boot config with paint-extras off),
+            // call set_source_rgb ONCE per row instead of once per cell.
+            // On VMware software Cairo this is the difference between
+            // freeze and fluid keyboard input.
+            for row in 0..rows {
                 if Some(row) == g.mode_line_row {
                     cr.set_source_rgb(0.94, 0.94, 0.94);
-                } else if let Some((r, gc, b)) = cell_color[row * cols_n + col] {
-                    cr.set_source_rgb(
-                        r as f64 / 255.0,
-                        gc as f64 / 255.0,
-                        b as f64 / 255.0,
-                    );
                 } else {
                     cr.set_source_rgb(0.0, 0.0, 0.0);
                 }
-                layout.set_text(ch.encode_utf8(&mut buf));
-                cr.move_to(col as f64 * g.cell_w, row as f64 * g.cell_h);
-                pangocairo::functions::show_layout(cr, &layout);
+                for col in 0..cols_n {
+                    let ch = g.grid.get(row, col);
+                    if ch == ' ' {
+                        continue;
+                    }
+                    layout.set_text(ch.encode_utf8(&mut buf));
+                    cr.move_to(col as f64 * g.cell_w, row as f64 * g.cell_h);
+                    pangocairo::functions::show_layout(cr, &layout);
+                }
+            }
+        } else {
+            // Phase 3.B path: flatten color_spans into a per-cell colour
+            // grid so the inner loop's lookup is O(1).  Later spans
+            // overwrite earlier ones (= matches the elisp side's
+            // `font-lock-keywords' first-match priority).
+            let mut cell_color: Vec<Option<(u8, u8, u8)>> = vec![None; rows * cols_n];
+            for &(sr, sc, er, ec, r, gc, b) in g.color_spans.iter() {
+                if sr == er {
+                    let lo = sc.min(ec);
+                    let hi = sc.max(ec).min(cols_n);
+                    if sr < rows {
+                        for c in lo..hi {
+                            cell_color[sr * cols_n + c] = Some((r, gc, b));
+                        }
+                    }
+                } else {
+                    let (sr2, sc2, er2, ec2) = if sr < er || (sr == er && sc < ec) {
+                        (sr, sc, er, ec)
+                    } else {
+                        (er, ec, sr, sc)
+                    };
+                    if sr2 < rows {
+                        for c in sc2..cols_n {
+                            cell_color[sr2 * cols_n + c] = Some((r, gc, b));
+                        }
+                    }
+                    for rr in (sr2 + 1)..er2.min(rows) {
+                        for c in 0..cols_n {
+                            cell_color[rr * cols_n + c] = Some((r, gc, b));
+                        }
+                    }
+                    if er2 < rows {
+                        for c in 0..ec2.min(cols_n) {
+                            cell_color[er2 * cols_n + c] = Some((r, gc, b));
+                        }
+                    }
+                }
+            }
+
+            // Phase 3.I: minimise set_source_rgb churn even on the slow
+            // path by tracking the most-recently-set colour and only
+            // re-setting it when the next cell's colour differs.
+            let mut last_color: Option<(u8, u8, u8)> = None;
+            let mut last_was_modeline = false;
+            for row in 0..rows {
+                let modeline_row = Some(row) == g.mode_line_row;
+                for col in 0..cols_n {
+                    let ch = g.grid.get(row, col);
+                    if ch == ' ' {
+                        continue;
+                    }
+                    let want_color: Option<(u8, u8, u8)> = if modeline_row {
+                        Some((240, 240, 240))
+                    } else {
+                        cell_color[row * cols_n + col].or(Some((0, 0, 0)))
+                    };
+                    if want_color != last_color || modeline_row != last_was_modeline {
+                        let (r, gc, b) = want_color.unwrap_or((0, 0, 0));
+                        cr.set_source_rgb(
+                            r as f64 / 255.0,
+                            gc as f64 / 255.0,
+                            b as f64 / 255.0,
+                        );
+                        last_color = want_color;
+                        last_was_modeline = modeline_row;
+                    }
+                    layout.set_text(ch.encode_utf8(&mut buf));
+                    cr.move_to(col as f64 * g.cell_w, row as f64 * g.cell_h);
+                    pangocairo::functions::show_layout(cr, &layout);
+                }
             }
         }
     });
