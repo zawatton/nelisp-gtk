@@ -1485,26 +1485,43 @@ fn build_window(
         let mut buf = [0u8; 4];
 
         if !has_color_spans {
-            // Phase 3.I fast path: when no per-cell color overrides are
-            // active (= the default boot config with paint-extras off),
-            // call set_source_rgb ONCE per row instead of once per cell.
-            // On VMware software Cairo this is the difference between
-            // freeze and fluid keyboard input.
+            // Phase 3.K fast path: paint each row as ONE Pango layout
+            // (= the whole row's text in a single set_text + show_layout
+            // call) instead of per-glyph.  For a 24×80 grid with typical
+            // text this drops show_layout calls from ~1300 → 24 per
+            // frame.  On VMware software Cairo this is the typing-lag
+            // killer — each show_layout reaches into Pango's shaper
+            // which is slow under software rendering.
+            //
+            // We trim trailing spaces from the row's text so empty
+            // tail-cells aren't shaped uselessly (= matches the
+            // per-glyph path's `if ch == ' ' continue').
+            let mut row_buf = String::with_capacity(cols_n * 4);
             for row in 0..rows {
                 if Some(row) == g.mode_line_row {
                     cr.set_source_rgb(0.94, 0.94, 0.94);
                 } else {
                     cr.set_source_rgb(0.0, 0.0, 0.0);
                 }
+                row_buf.clear();
+                let mut last_non_space = 0usize;
                 for col in 0..cols_n {
                     let ch = g.grid.get(row, col);
-                    if ch == ' ' {
-                        continue;
+                    row_buf.push(ch);
+                    if ch != ' ' {
+                        last_non_space = col + 1;
                     }
-                    layout.set_text(ch.encode_utf8(&mut buf));
-                    cr.move_to(col as f64 * g.cell_w, row as f64 * g.cell_h);
-                    pangocairo::functions::show_layout(cr, &layout);
                 }
+                if last_non_space == 0 {
+                    continue;
+                }
+                row_buf.truncate(0);
+                for col in 0..last_non_space {
+                    row_buf.push(g.grid.get(row, col));
+                }
+                layout.set_text(&row_buf);
+                cr.move_to(0.0, row as f64 * g.cell_h);
+                pangocairo::functions::show_layout(cr, &layout);
             }
         } else {
             // Phase 3.B path: flatten color_spans into a per-cell colour
