@@ -76,6 +76,12 @@ pub struct GtkState {
     pub grid: CharGrid,
     pub cell_w: f64,
     pub cell_h: f64,
+    /// Phase 2.BF — current Pango font description string (e.g.
+    /// "Monospace 12").  Mutated by `nelisp-gtk-set-font-size' so
+    /// the elisp frontend can implement text-scale-increase/decrease.
+    /// Both `measure_cell` + the draw callback read this at request
+    /// time so a font change retro-fits the next paint.
+    pub font: String,
     pub cursor: Option<(usize, usize)>,
     pub mode_line_row: Option<usize>,
     pub key_queue: VecDeque<KeyEvent>,
@@ -105,6 +111,7 @@ impl GtkState {
             grid: CharGrid::blank(0, 0),
             cell_w: 0.0,
             cell_h: 0.0,
+            font: FONT.to_string(),
             cursor: None,
             mode_line_row: None,
             key_queue: VecDeque::new(),
@@ -117,12 +124,13 @@ impl GtkState {
     }
 }
 
-/// Pango/Cairo cell-size probe.  Run once at GTK init; the cell grid
-/// uses the resulting (width, height) to stage glyph positions.
-fn measure_cell() -> (f64, f64) {
+/// Pango/Cairo cell-size probe.  Run at GTK init + on each
+/// `nelisp-gtk-set-font-size' call so the cell grid scales with the
+/// active Pango font description (`font' on `GtkState').
+fn measure_cell(font: &str) -> (f64, f64) {
     let fontmap = pangocairo::FontMap::default();
     let ctx = fontmap.create_context();
-    let desc = FontDescription::from_string(FONT);
+    let desc = FontDescription::from_string(font);
     let metrics = ctx.metrics(Some(&desc), None);
     let scale = pango::SCALE as f64;
     let cell_w = metrics.approximate_digit_width() as f64 / scale;
@@ -334,6 +342,35 @@ pub fn register_all(env: &mut Env, state: Rc<RefCell<GtkState>>) {
         let st = state.clone();
         env.register_extern_builtin("nelisp-gtk-redraw", move |_args, _env| {
             let g = st.borrow();
+            if let Some(area) = &g.area {
+                area.queue_draw();
+            }
+            Ok(Sexp::Nil)
+        });
+    }
+
+    // ----- nelisp-gtk-set-font-size SIZE -----
+    // Phase 2.BF — re-probe Pango cell metrics for the given integer
+    // point size (e.g. 14 → "Monospace 14"), update `font' / cell_w /
+    // cell_h on the shared state, queue a redraw.  The DrawingArea's
+    // resize signal will surface the new (rows, cols) on
+    // `resize_queue' so the elisp frontend can re-clamp its
+    // `--rows'/`--cols' defvars + repaint at the new dimensions.
+    {
+        let st = state.clone();
+        env.register_extern_builtin("nelisp-gtk-set-font-size", move |args, _env| {
+            let size = want_int(args, 0, "nelisp-gtk-set-font-size")?;
+            if size < 4 || size > 200 {
+                return Err(EvalError::ArithError(format!(
+                    "nelisp-gtk-set-font-size: size {size} out of range [4, 200]"
+                )));
+            }
+            let new_font = format!("Monospace {size}");
+            let (cell_w, cell_h) = measure_cell(&new_font);
+            let mut g = st.borrow_mut();
+            g.font = new_font;
+            g.cell_w = cell_w;
+            g.cell_h = cell_h;
             if let Some(area) = &g.area {
                 area.queue_draw();
             }
@@ -961,7 +998,7 @@ fn init_gtk(
     {
         let mut g = state.borrow_mut();
         g.app = Some(app);
-        let (cell_w, cell_h) = measure_cell();
+        let (cell_w, cell_h) = measure_cell(&g.font);
         g.cell_w = cell_w;
         g.cell_h = cell_h;
         g.initialized = true;
@@ -975,7 +1012,10 @@ fn build_window(
     rows: usize,
     cols: usize,
 ) {
-    let (cell_w, cell_h) = measure_cell();
+    let (cell_w, cell_h) = {
+        let g = state.borrow();
+        measure_cell(&g.font)
+    };
     let canvas_w = (cell_w * cols as f64).ceil() as i32;
     let canvas_h = (cell_h * rows as f64).ceil() as i32;
 
@@ -1025,7 +1065,7 @@ fn build_window(
         let _ = cr.paint();
 
         let layout = pangocairo::functions::create_layout(cr);
-        let desc = FontDescription::from_string(FONT);
+        let desc = FontDescription::from_string(&g.font);
         layout.set_font_description(Some(&desc));
 
         let canvas_w = g.cell_w * g.grid.cols as f64;
