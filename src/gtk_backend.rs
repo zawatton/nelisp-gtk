@@ -83,6 +83,11 @@ pub struct GtkState {
     /// time so a font change retro-fits the next paint.
     pub font: String,
     pub cursor: Option<(usize, usize)>,
+    /// Phase 2.BH — currently-highlighted region in (row, col) cell
+    /// coordinates: (start_row, start_col, end_row, end_col).  The
+    /// span is inclusive on the start cell + exclusive on the end
+    /// cell.  None = no region (= no highlight overlay rendered).
+    pub region: Option<(usize, usize, usize, usize)>,
     pub mode_line_row: Option<usize>,
     pub key_queue: VecDeque<KeyEvent>,
     pub menu_event_queue: VecDeque<String>,
@@ -113,6 +118,7 @@ impl GtkState {
             cell_h: 0.0,
             font: FONT.to_string(),
             cursor: None,
+            region: None,
             mode_line_row: None,
             key_queue: VecDeque::new(),
             menu_event_queue: VecDeque::new(),
@@ -345,6 +351,35 @@ pub fn register_all(env: &mut Env, state: Rc<RefCell<GtkState>>) {
             if let Some(area) = &g.area {
                 area.queue_draw();
             }
+            Ok(Sexp::Nil)
+        });
+    }
+
+    // ----- nelisp-gtk-set-region START-ROW START-COL END-ROW END-COL -----
+    // Phase 2.BH — set the region-highlight rectangle (= the
+    // [mark .. point] span).  When all four args are 0, the region
+    // is cleared (= no highlight).  Otherwise the cells from
+    // (start_row, start_col) up to (but not including) (end_row,
+    // end_col) — wrapping at line boundaries — are painted with a
+    // translucent overlay before the text on the next paint.
+    {
+        let st = state.clone();
+        env.register_extern_builtin("nelisp-gtk-set-region", move |args, _env| {
+            let sr = want_int(args, 0, "nelisp-gtk-set-region")?;
+            let sc = want_int(args, 1, "nelisp-gtk-set-region")?;
+            let er = want_int(args, 2, "nelisp-gtk-set-region")?;
+            let ec = want_int(args, 3, "nelisp-gtk-set-region")?;
+            let mut g = st.borrow_mut();
+            // Sentinel: all-zero span = clear (= elisp clears the
+            // region by passing 0 0 0 0 on every redraw cycle when
+            // there's no active mark).
+            g.region = if sr == 0 && sc == 0 && er == 0 && ec == 0 {
+                None
+            } else if sr < 0 || sc < 0 || er < 0 || ec < 0 {
+                None
+            } else {
+                Some((sr as usize, sc as usize, er as usize, ec as usize))
+            };
             Ok(Sexp::Nil)
         });
     }
@@ -1075,6 +1110,64 @@ fn build_window(
             cr.set_source_rgb(0.18, 0.18, 0.22);
             cr.rectangle(0.0, ml_row as f64 * g.cell_h, canvas_w, g.cell_h);
             let _ = cr.fill();
+        }
+
+        // Phase 2.BH — region highlight (= translucent blue overlay
+        // painted before the text + cursor so the chars + cursor
+        // remain legible on top).  The span wraps at line
+        // boundaries: same-row segment for sr == er, multi-row
+        // span paints (sr, sc..cols), full rows for sr+1..er, and
+        // (er, 0..ec) for the trailing partial.
+        if let Some((sr, sc, er, ec)) = g.region {
+            cr.set_source_rgba(0.30, 0.55, 0.95, 0.30);
+            let cols = g.grid.cols;
+            if sr == er {
+                let lo = sc.min(ec);
+                let hi = sc.max(ec);
+                if hi > lo {
+                    cr.rectangle(
+                        lo as f64 * g.cell_w,
+                        sr as f64 * g.cell_h,
+                        (hi - lo) as f64 * g.cell_w,
+                        g.cell_h,
+                    );
+                    let _ = cr.fill();
+                }
+            } else {
+                let (sr, sc, er, ec) = if sr < er || (sr == er && sc < ec) {
+                    (sr, sc, er, ec)
+                } else {
+                    (er, ec, sr, sc)
+                };
+                // First row: sc..cols
+                cr.rectangle(
+                    sc as f64 * g.cell_w,
+                    sr as f64 * g.cell_h,
+                    (cols.saturating_sub(sc)) as f64 * g.cell_w,
+                    g.cell_h,
+                );
+                let _ = cr.fill();
+                // Middle rows: full width
+                if er > sr + 1 {
+                    cr.rectangle(
+                        0.0,
+                        (sr + 1) as f64 * g.cell_h,
+                        cols as f64 * g.cell_w,
+                        (er - sr - 1) as f64 * g.cell_h,
+                    );
+                    let _ = cr.fill();
+                }
+                // Last row: 0..ec
+                if ec > 0 {
+                    cr.rectangle(
+                        0.0,
+                        er as f64 * g.cell_h,
+                        ec as f64 * g.cell_w,
+                        g.cell_h,
+                    );
+                    let _ = cr.fill();
+                }
+            }
         }
 
         // Block cursor.
