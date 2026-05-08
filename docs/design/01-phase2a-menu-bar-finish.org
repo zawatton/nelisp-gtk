@@ -1,0 +1,276 @@
+#+TITLE: nelisp-emacs-gtk Doc 01 — Phase 2.A Menu Bar Finish-line Spec
+#+AUTHOR: zawatton + Claude
+#+DATE: 2026-05-09
+#+STATUS: DRAFT
+#+DEPENDS_ON: nelisp-emacs Doc 02 v0.1 daily-driver gate (M1 SHIPPED 2026-05-08, M2 SHIPPED 2026-05-09)
+#+SIBLINGS: nelisp-emacs Doc 51 emacs-builtins port (Phase 3 SHIPPED)
+
+* §0 motivation
+
+** 0.1 既 SHIPPED 部分
+
+Phase 2.A "native menu bar (GMenuModel)" は CLAUDE.md の phase plan で
+*未* 扱いだったが、実は infrastructure 全体が既 SHIPPED 済:
+
+- *Rust 側* (`src/gtk_backend.rs`):
+  - `nelisp-gtk-set-menu-bar SPEC` extern (= GMenuModel build + GtkApplication 結線)
+  - `nelisp-gtk-poll-menu-event` extern (= action string queue で elisp に dispatch)
+  - `nelisp-gtk-show-context-menu` extern (= 右クリック context menu、Phase 2.S 済)
+  - `menu_event_queue: VecDeque<String>` (= 内部 dispatch 機構)
+
+- *Elisp 側* (`nemacs-gtk-frontend.el`):
+  - `nemacs-gtk--menu-spec` defconst (= File / Edit / Help 3 menu)
+  - boot 時 `(nelisp-gtk-set-menu-bar nemacs-gtk--menu-spec)` 呼出
+  - `nemacs-gtk--handle-menu-action` dispatcher (= "save" / "quit" / "cut" 等の string action を command に変換)
+
+つまり menu bar **可視 + click 可動作 はすでに使える**。CLAUDE.md phase plan
+での "Phase 2.A 完了" gate (= File / Edit menus visible) は満たしている。
+
+** 0.2 v0.1 残課題 (= 本 doc の scope)
+
+ただし以下が user 体感で未完:
+
+1. *M1 commands との wiring 不足* — File menu の "Open" / "Save" 等が
+   M1 の =find-file= / =save-buffer= / =dired= を直接呼ばない (= 旧
+   `nemacs-gtk-keyboard-find-file` legacy handler 経由)
+2. *M2 commands の menu 露出なし* — describe-function / undo / isearch 等
+   M2 で ship したものが menu に出ていない
+3. *accelerator hint 未表示* — menu 項目の右に "Ctrl+O" 等の表示なし
+   (GMenuModel の accel 結線必要)
+4. *buffer-list submenu の dynamic 化* — 既 `nemacs-gtk--buffer-menu-spec`
+   関数あるが menu bar に組み込まれてない (= context menu のみ)
+
+* §1 scope
+
+** 1.1 in-scope
+
+- M1 dispatch: File menu → =find-file= / =save-buffer= / =write-file= / =dired= / =switch-to-buffer= / =list-buffers= / =kill-buffer= に直結
+- M2 dispatch: Edit menu → =isearch-forward= / =undo= / =undo-redo= / =eval-defun= に直結、Help menu → =describe-function= / =describe-variable= / =describe-key= / =M-x ielm=
+- accelerator hint 表示 (= "Open File\tCtrl-X Ctrl-F" 風)
+- buffer-list を View menu に動的展開
+- context menu (右クリック) も M1 commands に対応 (= "Open in this buffer" 等の追加)
+
+** 1.2 out-of-scope (= Phase 4 / 別 milestone)
+
+- M3 (org-mode) commands の menu 露出 (= M3 SHIPPED 後に追加)
+- M4 (shell-command / project) の menu (= 同上)
+- recent files menu (= File → Recent submenu、要 history file)
+- session save/restore (= File → Save Session)
+- toolbar (= GMenuModel と別、scope 大)
+- multi-frame menu sync (= Phase 2.E 後)
+
+* §2 architecture
+
+** 2.1 既 menu_event_queue 機構を維持
+
+dispatch flow (= 変更なし):
+
+```
+User clicks "File" → "Open"
+  → GtkApplication action triggered
+  → Rust pushes "open-file" string into menu_event_queue
+  → elisp main loop polls (nelisp-gtk-poll-menu-event) → "open-file"
+  → nemacs-gtk--handle-menu-action "open-file" dispatched
+  → (call-interactively #'find-file)
+```
+
+本 phase は (a) menu spec の枝を増やす、(b) action string → command の
+mapping を増やす、の 2 点のみ。Rust 側変更は accelerator 表示分のみ。
+
+** 2.2 menu spec 拡張
+
+`nemacs-gtk--menu-spec` を以下に拡張:
+
+```elisp
+(defconst nemacs-gtk--menu-spec
+  '(("File"
+     ("Open File..."         . "find-file")        ; M1
+     ("Open Recent"          . nil)                ; v0.1 後送り
+     ("Save"                 . "save-buffer")      ; M1
+     ("Save As..."           . "write-file")       ; M1
+     ("---"                  . nil)                ; separator
+     ("Open Directory..."    . "dired")            ; M1
+     ("Switch Buffer..."     . "switch-to-buffer") ; M1
+     ("List Buffers"         . "list-buffers")     ; M1
+     ("Kill Buffer"          . "kill-buffer")      ; M1
+     ("---"                  . nil)
+     ("Quit"                 . "quit"))
+    ("Edit"
+     ("Undo"                 . "undo")             ; M2
+     ("Redo"                 . "undo-redo")        ; M2
+     ("---"                  . nil)
+     ("Cut"                  . "cut")              ; 既存
+     ("Copy"                 . "copy")
+     ("Paste"                . "paste")
+     ("Select All"           . "select-all")
+     ("---"                  . nil)
+     ("Find..."              . "isearch-forward") ; M2
+     ("Find Backward..."     . "isearch-backward")) ; M2
+    ("View"
+     ("Split Below"          . "split-window-below")  ; M1
+     ("Split Right"          . "split-window-right")  ; M1
+     ("Other Window"         . "other-window")        ; M1
+     ("Delete Window"        . "delete-window")       ; M1
+     ("Single Window"        . "delete-other-windows")) ; M1
+    ("Tools"
+     ("Eval Last Sexp"       . "eval-last-sexp")      ; M2
+     ("Eval Region"          . "eval-region")         ; M2
+     ("Eval Buffer"          . "eval-buffer")         ; M2
+     ("ielm"                 . "ielm"))               ; M2
+    ("Help"
+     ("Describe Function..." . "describe-function")   ; M2
+     ("Describe Variable..." . "describe-variable")   ; M2
+     ("Describe Key..."      . "describe-key")        ; M2
+     ("---"                  . nil)
+     ("About"                . "about")))
+  "...")
+```
+
+** 2.3 separator + accelerator extension
+
+separator の表現は現状 `("---" . nil)` で codex に解釈してもらう (= Rust
+側が `gio::Menu::insert_section` で扱う)。
+
+accelerator 表示は GMenu の `accel` attribute で結線。Rust 側 patch:
+
+```rust
+// src/gtk_backend.rs install_menu_bar / build_submenu
+//   - For each leaf, if action string has a known accel mapping,
+//     call menu.set_attribute_value("accel", ...).
+```
+
+accel mapping は elisp 側 defvar から渡す:
+
+```elisp
+(defconst nemacs-gtk--menu-accels
+  '(("find-file"            . "<Ctrl>X <Ctrl>F")
+    ("save-buffer"          . "<Ctrl>X <Ctrl>S")
+    ("dired"                . "<Ctrl>X D")
+    ("switch-to-buffer"     . "<Ctrl>X B")
+    ("kill-buffer"          . "<Ctrl>X K")
+    ("undo"                 . "<Ctrl>/")
+    ("undo-redo"            . "<Ctrl>X U")
+    ("isearch-forward"      . "<Ctrl>S")
+    ("isearch-backward"     . "<Ctrl>R")
+    ("eval-last-sexp"       . "<Ctrl>X <Ctrl>E")
+    ("eval-region"          . nil) ; not bound
+    ("describe-function"    . "<Ctrl>H F")
+    ("describe-variable"    . "<Ctrl>H V")
+    ("describe-key"         . "<Ctrl>H K")))
+```
+
+new extern: `(nelisp-gtk-set-menu-accels ALIST)` で Rust にこの map を
+事前共有、`nelisp-gtk-set-menu-bar` 後の build phase で参照。
+
+* §3 task breakdown
+
+** 3.1 Task A: menu spec extension + dispatcher mapping (Elisp 単独)
+
+Branch: `feat/v01-gtk-phase2a-menu-extension` (= nelisp-emacs upstream
+worktree、`nemacs-gtk-frontend.el` を編集)
+
+scope:
+- =nemacs-gtk--menu-spec= 拡張 (上記 §2.2 構造)
+- =nemacs-gtk--handle-menu-action= に新 action string 17 件分の cond 追加
+- 各 action は =(call-interactively #'COMMAND)= か =(COMMAND)= を呼出
+- separator =("---" . nil)= の処理は 既 install_menu_bar の Rust 側 build を信頼
+
+LOC 見積: ~80-150
+ERT (target ≥3): nemacs-gtk-handle-menu-action-find-file / -isearch / -describe-function
+
+** 3.2 Task B: accelerator hint (Rust + Elisp)
+
+Branch: `feat/v01-gtk-phase2a-menu-accel` (= nelisp-emacs-gtk repo 側)
+
+scope:
+- new extern `nelisp-gtk-set-menu-accels ALIST` in `src/gtk_backend.rs`
+  - alist の (action_name . gtk_accel_string) を `HashMap<String, String>` に保存
+- `install_menu_bar` の `build_submenu` 内で leaf 作成時に `accel` attribute set
+- elisp `nemacs-gtk--menu-accels` defconst (上記 §2.3) + boot 時呼出
+
+LOC 見積: Rust ~80-120 + Elisp ~30-50
+test: 統合 manual test (= GTK menu 表示時に accel hint 出る確認)、ERT は accel mapping defvar の 値 sanity のみ
+
+** 3.3 Task C: buffer-list を View menu に動的展開
+
+scope:
+- View menu の "Switch Buffer" を submenu 化 (= 開く度に現在の buffer-list を流し込む)
+- 既 =nemacs-gtk--buffer-menu-spec= 関数を再利用、menu open hook で再 build
+
+LOC 見積: ~60-100 (Elisp + Rust の menu rebuild trigger 結線、optional / Phase 2.E 後送り可能)
+
+* §4 ship gate
+
+| # | gate |
+|---+------|
+| 1 | nemacs-gtk 起動 → File menu に "Open File..." / "Save" / "Open Directory..." / "Switch Buffer..." 表示 |
+| 2 | "Open File..." click → =find-file= prompt (= M1) が起動、file 開く |
+| 3 | "Open Directory..." click → =dired= 起動 |
+| 4 | Edit menu → "Undo" click で =undo= 走る (= M2 emacs-undo-ui) |
+| 5 | Tools menu → "ielm" click で =*ielm*= buffer 開く (= M2) |
+| 6 | Help menu → "Describe Function..." click で =describe-function= prompt 起動 |
+| 7 | menu 項目右に accelerator hint (= "Ctrl+X Ctrl+F" 等) 表示 |
+| 8 | byte-compile clean (= nelisp-emacs side) + cargo build clean (= nelisp-emacs-gtk side) |
+
+* §5 dispatch 構成
+
+3 task parallel 想定:
+
+| stream | branch | repo | LOC | priority |
+|--------+--------+------+-----+----------|
+| Task A: menu spec ext | feat/v01-gtk-phase2a-menu-extension | nelisp-emacs | 80-150 | high |
+| Task B: accel hint | feat/v01-gtk-phase2a-menu-accel | nelisp-emacs-gtk | 110-170 | medium |
+| Task C: buffer-list dyn | feat/v01-gtk-phase2a-buffer-submenu | nelisp-emacs | 60-100 | low |
+
+Task A は M1/M2 ship 後に着手、依存性: emacs-fileio.el / emacs-dired-min.el /
+emacs-buffer-ui.el / emacs-isearch.el / emacs-help.el / emacs-undo-ui.el /
+emacs-elisp-eval.el / emacs-ielm.el = M1 (4 module) + M2 (5 module) 全
+SHIPPED が前提。
+
+Task B / Task C は Task A と並列可能。
+
+期間: Task A = ~3-5d、Task B = ~5-7d、Task C = ~3-5d。並列で **~1 週間**で
+完遂見込み。
+
+* §6 open question
+
+** 6.1 既存 nemacs-gtk-keyboard-find-file との重複
+
+`nemacs-gtk-frontend.el` line 440 に既存の =nemacs-gtk-keyboard-find-file= 
+function あり。M1 の =find-file= (=emacs-fileio.el=) と命名が違うので
+直接の collision はない。但し:
+
+- 旧: =nemacs-gtk-keyboard-find-file= = GTK file dialog (= GtkFileChooser) を pop
+- 新: =find-file= (M1) = minibuffer prompt + read-file-name
+
+UX として menu の "Open File..." はどちらを呼ぶべきか?
+- 案 X: GTK file dialog (= UI 統一)
+- 案 Y: minibuffer (= Emacs 互換)
+
+決定 = case 案 X (GTK 標準体験) を default、=C-x C-f= keybinding は minibuffer
+(= M1 互換) で残す。両者共存。
+
+** 6.2 menu_event_queue の throughput
+
+現在の `(nelisp-gtk-poll-menu-event)` は main loop 1 tick/event。複数 menu
+click 連打で queue 詰まりは想定されないが、Phase 2.E (multi-frame) 後に
+window 単位 queue が必要になる可能性。本 phase では single queue 維持。
+
+** 6.3 accelerator string の GTK 形式
+
+GTK の accel string は `<Ctrl>X <Ctrl>F` 形式 (= GtkApplication.set_accels_for_action)。
+elisp 側 keybind と整合した string 生成 helper が必要。
+=nemacs-gtk--keybind-to-gtk-accel= を Task B で実装。
+
+* §7 next action
+
+1. M2 SHIPPED 確定 (本 doc 起草と同 session 進行中) → memory 更新
+2. Task A 着手 (= codex 1 task、emacs-fileio/dired/buffer-ui/undo-ui/eval/help/ielm 全部の
+   action wiring を 1 module で)
+3. Task B 着手 (= 並列、Rust + Elisp 両側 patch、別 worktree)
+4. v0.1 close gate に "Phase 2.A 完成" 項目を追加 (Doc 02 §1.3 改訂)
+
+* §8 revision log
+
+- v0 (2026-05-09): 初版 DRAFT。M1 + M2 SHIPPED 直後の現状把握 + finish-line
+  spec として位置付け
