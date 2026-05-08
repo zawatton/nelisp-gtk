@@ -12,7 +12,7 @@
 // `nemacs-gtk-frontend.el' on the substrate side.
 
 use std::cell::RefCell;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::rc::Rc;
 
@@ -111,6 +111,7 @@ pub struct GtkState {
     pub mode_line_row: Option<usize>,
     pub key_queue: VecDeque<KeyEvent>,
     pub menu_event_queue: VecDeque<String>,
+    pub menu_accels: HashMap<String, String>,
     pub mouse_event_queue: VecDeque<MouseEvent>,
     /// Most-recently-pressed mouse button that has not yet been
     /// released — populated by `GestureClick::connect_pressed' and
@@ -145,6 +146,7 @@ impl GtkState {
             mode_line_row: None,
             key_queue: VecDeque::new(),
             menu_event_queue: VecDeque::new(),
+            menu_accels: HashMap::new(),
             mouse_event_queue: VecDeque::new(),
             mouse_pressed_button: None,
             resize_queue: VecDeque::new(),
@@ -976,6 +978,25 @@ pub fn register_all(env: &mut Env, state: Rc<RefCell<GtkState>>) {
         });
     }
 
+    // ----- nelisp-gtk-set-menu-accels ALIST -----
+    //
+    // ALIST shape:
+    //
+    //   ((ACTION-NAME-STRING . ACCEL-STRING) ...)
+    //
+    // Replaces the entire action-name -> accel-string mapping used by
+    // `install_leaf_action' to attach GTK4 `accel' hints on menu items.
+    {
+        let st = state.clone();
+        env.register_extern_builtin("nelisp-gtk-set-menu-accels", move |args, _env| {
+            let alist = args.get(0).cloned().unwrap_or(Sexp::Nil);
+            let menu_accels = parse_menu_accels(&alist)?;
+            let mut g = st.borrow_mut();
+            g.menu_accels = menu_accels;
+            Ok(Sexp::T)
+        });
+    }
+
     // ----- nelisp-gtk-poll-menu-event () -> STRING | nil -----
     {
         let st = state.clone();
@@ -1405,7 +1426,11 @@ fn install_leaf_action(
     // app actions).
     let gaction_name = format!("menu-{action_name}");
     let action_target = format!("app.{gaction_name}");
-    menu.append(Some(label), Some(&action_target));
+    let menu_item = gio::MenuItem::new(Some(label), Some(&action_target));
+    if let Some(accel) = state.borrow().menu_accels.get(action_name).cloned() {
+        menu_item.set_attribute_value("accel", Some(&accel.to_variant()));
+    }
+    menu.append_item(&menu_item);
 
     let action = gio::SimpleAction::new(&gaction_name, None);
     let st = state.clone();
@@ -1416,6 +1441,33 @@ fn install_leaf_action(
             .push_back(action_name_owned.clone());
     });
     app.add_action(&action);
+}
+
+fn parse_menu_accels(spec: &Sexp) -> Result<HashMap<String, String>, EvalError> {
+    let mut out = HashMap::new();
+    for entry in sexp_list_iter(spec) {
+        let (action, accel) = match entry {
+            Sexp::Cons(car, cdr) => {
+                let action = car.borrow().as_string_owned().ok_or_else(|| EvalError::WrongType {
+                    expected: "stringp".into(),
+                    got: car.borrow().clone(),
+                })?;
+                let accel = cdr.borrow().as_string_owned().ok_or_else(|| EvalError::WrongType {
+                    expected: "stringp".into(),
+                    got: cdr.borrow().clone(),
+                })?;
+                (action, accel)
+            }
+            other => {
+                return Err(EvalError::WrongType {
+                    expected: "consp".into(),
+                    got: other,
+                });
+            }
+        };
+        out.insert(action, accel);
+    }
+    Ok(out)
 }
 
 /// Pop a context menu (= `gtk::PopoverMenu') anchored at cell (ROW, COL)
@@ -1965,3 +2017,33 @@ fn build_window(
 
 // `gio` is re-exported by gtk4 but we need `Cancellable` directly.
 use gtk::gio;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn set_menu_accels() {
+        let spec = Sexp::list_from(&[
+            Sexp::cons(Sexp::Str("find-file".into()), Sexp::Str("<Ctrl>X <Ctrl>F".into())),
+            Sexp::cons(Sexp::Str("save-buffer".into()), Sexp::Str("<Ctrl>X <Ctrl>S".into())),
+        ]);
+
+        let parsed = parse_menu_accels(&spec).expect("menu accel alist should parse");
+
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed.get("find-file"), Some(&"<Ctrl>X <Ctrl>F".to_string()));
+        assert_eq!(parsed.get("save-buffer"), Some(&"<Ctrl>X <Ctrl>S".to_string()));
+
+        let mut state = GtkState::new();
+        state.menu_accels = parsed;
+        assert_eq!(
+            state.menu_accels.get("find-file"),
+            Some(&"<Ctrl>X <Ctrl>F".to_string())
+        );
+        assert_eq!(
+            state.menu_accels.get("save-buffer"),
+            Some(&"<Ctrl>X <Ctrl>S".to_string())
+        );
+    }
+}
