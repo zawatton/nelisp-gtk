@@ -2,3 +2,12 @@
 *.swp
 *~
 .DS_Store
+
+# AI assistant project-instruction files — kept local, not published.
+CLAUDE.md
+AGENTS.md
+.cursorrules
+.cursor/
+.aider*
+.codex/
+.windsurfrules
