@@ -19,8 +19,10 @@
 ;;
 ;; All bindings here are STUBS pending two prerequisites:
 ;;
-;;   1. `nl-ffi-closure-new' / `nl-ffi-closure-free' (= Phase B0.a, work
-;;      lives in nelisp/build-tool/src/eval/ffi.rs, NOT this repo).
+;;   1. `nelisp-gtk-make-closure' / `nelisp-gtk-free-closure' builtins
+;;      (= Phase B0.a).  Implemented in **this repo's Rust shim**
+;;      (sibling to gtk_backend.rs / nelisp_bridge.rs), registered via
+;;      `register_all'.  Upstream nelisp is *not* modified.
 ;;      Forward calls already work via the shipped `nl-ffi-call'.
 ;;
 ;;   2. Resolved shared-object paths.  We do not bake absolute paths;
@@ -62,12 +64,13 @@ Fedora / NixOS) do not require code edits.")
 
 (defun nelisp-gtk-ffi--require-closure ()
   "Signal a structured error when the closure-FFI prerequisite is missing.
-Phase B0.a (= `nl-ffi-closure-new' in nelisp/build-tool/src/eval/ffi.rs)
-must ship before any signal-connect / draw-func wrapper can work."
-  (unless (fboundp 'nl-ffi-closure-new)
+Phase B0.a (= the `nelisp-gtk-make-closure' builtin registered by this
+repo's Rust shim) must ship before any signal-connect / draw-func
+wrapper can work."
+  (unless (fboundp 'nelisp-gtk-make-closure)
     (error
-     (concat "nelisp-gtk-ffi: `nl-ffi-closure-new' missing — "
-             "ship Phase B0.a in upstream nelisp before retrying. "
+     (concat "nelisp-gtk-ffi: `nelisp-gtk-make-closure' missing — "
+             "ship Phase B0.a in this repo's Rust shim before retrying. "
              "See docs/design/02-phase-b0-pure-elisp-spike.org §3."))))
 
 ;; ---------------------------------------------------------------------
@@ -168,11 +171,12 @@ pass argc=0)."
   "Connect CALLBACK (= elisp callable) to SIGNAL-NAME on INSTANCE-PTR.
 Returns the connection handler id as an integer.
 
-STUB: needs `nl-ffi-closure-new' to convert CALLBACK to a C function
-pointer.  See `docs/design/02-phase-b0-pure-elisp-spike.org' §3."
+STUB: needs `nelisp-gtk-make-closure' (= Phase B0.a, registered by
+this repo's Rust shim) to convert CALLBACK to a C function pointer.
+See `docs/design/02-phase-b0-pure-elisp-spike.org' §3."
   (nelisp-gtk-ffi--require-closure)
   (let* ((sig (vector :sint64 :pointer :pointer :pointer))
-         (cb-ptr (nl-ffi-closure-new sig callback)))
+         (cb-ptr (nelisp-gtk-make-closure sig callback)))
     (nl-ffi-call (nelisp-gtk-ffi--lib :gobject)
                  "g_signal_connect_data"
                  [:uint64 :pointer :string :pointer :pointer :pointer :uint32]
@@ -182,10 +186,11 @@ pointer.  See `docs/design/02-phase-b0-pure-elisp-spike.org' §3."
   "Register DRAW-CB (= elisp callable) as the `draw' func for AREA-PTR.
 DRAW-CB is invoked as (DRAW-CB AREA-PTR CR-PTR WIDTH HEIGHT).
 
-STUB: needs `nl-ffi-closure-new'.  See doc §3 for the prereq."
+STUB: needs `nelisp-gtk-make-closure' from this repo's Rust shim.
+See `docs/design/02-phase-b0-pure-elisp-spike.org' §3 for the prereq."
   (nelisp-gtk-ffi--require-closure)
   (let* ((sig (vector :void :pointer :pointer :sint32 :sint32 :pointer))
-         (cb-ptr (nl-ffi-closure-new sig draw-cb)))
+         (cb-ptr (nelisp-gtk-make-closure sig draw-cb)))
     (nl-ffi-call (nelisp-gtk-ffi--lib :gtk)
                  "gtk_drawing_area_set_draw_func"
                  [:void :pointer :pointer :pointer :pointer]

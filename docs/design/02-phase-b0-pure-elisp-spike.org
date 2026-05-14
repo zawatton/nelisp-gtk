@@ -2,7 +2,7 @@
 #+AUTHOR: zawatton + Claude
 #+DATE: 2026-05-14
 #+STATUS: DRAFT
-#+DEPENDS_ON: nelisp/build-tool/src/eval/ffi.rs (= the `nl-ffi-call` primitive that this spike extends)
+#+DEPENDS_ON: this repo's existing Rust shim (= `nelisp-gtk/src/`, which already embeds NeLisp via the `nelisp` Cargo dep and registers extern builtins).  Upstream `nelisp` is *not* modified.
 
 * §0 motivation
 
@@ -57,68 +57,98 @@ Non-goals for this spike:
 #+begin_src
 ┌──────────────────────────────────────────────────────────────┐
 │ examples/hello-window.el                                     │
-│   (gtk-app-new "io.zawatton.nelisp-gtk.spike")               │
-│   (gtk-app-on-activate cb)                                   │
-│   (gtk-window-set-child win area)                            │
-│   (gtk-drawing-area-set-draw-func area #'my-draw-cb)         │
-│   (gtk-app-run app)                                          │
+│   (nelisp-gtk-ffi-application-new "io.zawatton..." 0)        │
+│   (nelisp-gtk-ffi-signal-connect app "activate" cb)          │
+│   (nelisp-gtk-ffi-drawing-area-set-draw-func area draw-cb)   │
+│   (nelisp-gtk-ffi-application-run app 0 0)                   │
 └─────────────▲────────────────────────────────────────────────┘
               │ pure-elisp API
 ┌─────────────┴────────────────────────────────────────────────┐
-│ src/nelisp-gtk-ffi.el                                        │
-│   - thin wrappers over nl-ffi-call / nl-ffi-closure          │
+│ src/nelisp-gtk-ffi.el (= elisp wrappers, this repo)          │
+│   - thin wrappers over nl-ffi-call (forward)                 │
+│   - signal-connect / draw-func wrappers around               │
+│     nelisp-gtk-make-closure (closure builtin)                │
 │   - GObject ref / unref helpers                              │
-│   - signal-connect helpers (= elisp lambda → C closure ptr)  │
-│   - type marshalling: Cairo context, GtkWidget, GValue       │
 └─────────────▲────────────────────────────────────────────────┘
-              │ nl-ffi-call (existing) + nl-ffi-closure (new)
+              │ nl-ffi-call (= upstream nelisp, unchanged)
+              │ nelisp-gtk-make-closure (= NEW, this repo)
 ┌─────────────┴────────────────────────────────────────────────┐
-│ nelisp/build-tool/src/eval/ffi.rs                            │
-│   - existing: nl-ffi-call (forward)                          │
-│   - NEW (B0.a):                                              │
-│     - nl-ffi-closure-new : SIG + lambda → opaque ptr handle  │
-│     - nl-ffi-closure-free : drop closure                     │
-│     - libffi `Closure` is registered, holds Cif + a callback │
-│       trampoline that marshals C arg array → Sexp and calls  │
-│       the captured elisp lambda; result marshalled back.     │
+│ nelisp-gtk/src/ (= this repo's existing Rust shim)           │
+│   - existing: GTK builtins registered via register_all       │
+│       (nelisp-gtk-put-cell / -paint-frame / -iterate / ...)  │
+│   - NEW (B0.a, ~150-300 LOC Rust addition):                  │
+│     - nelisp-gtk-make-closure : SIG + lambda → opaque ptr    │
+│     - nelisp-gtk-free-closure : drop closure                 │
+│     - libffi `Closure` holds Cif + a Rust trampoline that    │
+│       marshals C arg array → Sexp, calls the captured elisp  │
+│       lambda through the live Env, marshals result back.     │
+│                                                              │
+│   nelisp Cargo dep already gives Rust-side `Env` access      │
+│   (= same path nelisp-gtk-* GTK builtins use today, see      │
+│   `gtk_backend::register_all(session.env_mut(), ...)`).      │
+│   No upstream nelisp changes required.                       │
+│                                                              │
+│   This Rust code is itself transitional — Phase B (=replace  │
+│   gtk4-rs with bare FFI from elisp) retires the GTK builtins,│
+│   and Phase C drops the shim entirely.  Closure support is   │
+│   the LAST thing left in the shim before C — which is the    │
+│   point where pure-elisp NeLisp closures (Phase 47 native    │
+│   cc trampoline emission) need to take over.                 │
 └──────────────────────────────────────────────────────────────┘
 #+end_src
 
-* §3 prerequisite — `nl-ffi-closure` (Phase B0.a)
+* §3 prerequisite — closure builtins in this repo's Rust shim (Phase B0.a)
 
-The current =nl-ffi-call= in =nelisp/build-tool/src/eval/ffi.rs= (820
-LOC) is forward-only.  It uses the =libffi= crate's =Cif= but never
-invokes =Closure=.  We need two new primitives:
+Upstream =nelisp= ships =nl-ffi-call= (= forward call only, uses
+=libffi= crate's =Cif=).  Growing it with =Closure= support there would
+violate that repo's commitment ("Rust 削減が唯一の評価軸" — Rust
+shrinkage is the sole evaluation axis).  Instead this spike adds the
+closure capability to **this repo's existing Rust shim**, where it
+belongs both legally (= same crate that already does
+=register_extern_builtin("nelisp-gtk-*", ...)=) and architecturally
+(= the closure feature retires together with the rest of the shim when
+Phase B → C completes).
 
-** 3.1 `nl-ffi-closure-new`
+Two new builtins are registered in =gtk_backend::register_all= (or a
+sibling =closure.rs= module) and consumed by =src/nelisp-gtk-ffi.el=:
+
+** 3.1 `nelisp-gtk-make-closure`
 
 #+begin_src elisp
-(nl-ffi-closure-new SIG LAMBDA)
-  SIG    = vector of type keywords (same shape as `nl-ffi-call').
-  LAMBDA = elisp callable; receives ARGS as a list, must return a
-           value of the C return type indicated by SIG[0].
+(nelisp-gtk-make-closure SIG LAMBDA)
+  SIG    = vector of type keywords (same shape as `nl-ffi-call'):
+           element 0 = return type, rest = arg types.
+  LAMBDA = elisp callable; receives marshalled args as a list, must
+           return a value of the C return type indicated by SIG[0].
 
   Returns: opaque integer (= C function pointer cast to uintptr_t)
-  that can be passed to nl-ffi-call as a `:pointer' argument.
+  that can be passed to nl-ffi-call (or any C API) as a `:pointer'
+  argument.
 #+end_src
 
-Rust implementation outline:
+Rust implementation outline (= ~150-300 LOC in this repo, sibling to
+=gtk_backend.rs= and =nelisp_bridge.rs=):
 
 #+begin_src rust
-// One closure is heap-allocated and leaked into a registry so the
-// trampoline always finds it.  Dropping is via nl-ffi-closure-free.
+// One closure is heap-allocated and leaked into a registry indexed by
+// the returned uintptr.  `nelisp-gtk-free-closure' drops the entry.
 struct ClosureEntry {
     cif: Cif,
     closure: Closure<'static>,
-    callback: Box<dyn Fn(Vec<Sexp>) -> Sexp + Send>,
+    callback: Box<dyn Fn(Vec<Sexp>) -> Sexp>,
 }
 // The libffi trampoline (= extern "C" fn(...)) takes the raw arg
-// pointers, marshals them via the stored Cif to Sexp, calls the
-// elisp lambda through the captured Env handle, marshals the
-// returned Sexp back to the C return slot.
+// pointers, marshals them via the stored Cif to `Vec<Sexp>`, calls the
+// captured elisp lambda through the Session's `Env' (= the same path
+// gtk_backend extern builtins already use), and marshals the result
+// back to the C return slot.
+//
+// register_all in gtk_backend.rs gains:
+//   env.register_extern_builtin("nelisp-gtk-make-closure", |args, env| {...});
+//   env.register_extern_builtin("nelisp-gtk-free-closure", |args, env| {...});
 #+end_src
 
-** 3.2 `nl-ffi-closure-free`
+** 3.2 `nelisp-gtk-free-closure`
 
 Releases the closure (= drops the registry entry).  Optional for the
 PoC — the spike can leak the single =draw= callback for its lifetime
@@ -168,12 +198,15 @@ Total: 14 symbols.  All are stable in GTK4 ≥ 4.10.
 
 | Step | Work                                                           | Est. |
 |------+----------------------------------------------------------------+------|
-| 1    | Implement `nl-ffi-closure-new` / `-free` in `ffi.rs` + Rust ERT | 3-5 d |
-| 2    | `make test` green on nelisp main                               | 0.5 d |
-| 3    | Land `src/nelisp-gtk-ffi.el` with 14-symbol surface             | 2-3 d |
-| 4    | Land `examples/hello-window.el` (= the PoC under §1.6 LOC cap)  | 1-2 d |
-| 5    | Manual demo: window opens, draw cb fires, close ⇒ clean exit    | 0.5 d |
-| 6    | Capture findings doc (= what worked, what's hard, B → C path)   | 1 d  |
+| Step | Work                                                                        | Est.  |
+|------+-----------------------------------------------------------------------------+-------|
+| 1    | Implement `nelisp-gtk-make-closure` / `-free-closure` in this repo (Rust)    | 3-5 d |
+| 2    | Register them in `gtk_backend::register_all` + Rust unit test (round-trip)   | 0.5 d |
+| 3    | `cargo build` + the existing `cargo run` smoke path still works              | 0.5 d |
+| 4    | Land `src/nelisp-gtk-ffi.el` with the 14-symbol surface                      | 2-3 d |
+| 5    | Land `examples/hello-window.el` (= the PoC under §1.6 LOC cap)               | 1-2 d |
+| 6    | Manual demo: window opens, draw cb fires, close ⇒ clean exit                 | 0.5 d |
+| 7    | Capture findings (= §7) + B → C path notes                                   | 1 d   |
 
 Total: **~2-3 weeks**, single-maintainer evening hours.
 
@@ -181,8 +214,10 @@ Total: **~2-3 weeks**, single-maintainer evening hours.
 
 Phase B0 is *MERGED-OK* when:
 
-1. `nelisp` main has `nl-ffi-closure-{new,free}` shipped + ERT tests
-   covering "elisp callback runs and returns correct C type".
+1. This repo's Rust shim ships `nelisp-gtk-make-closure` /
+   `-free-closure` + Rust unit tests covering "elisp callback runs
+   and returns correct C type for `:sint32` / `:double` / `:pointer`
+   return values".  Upstream `nelisp` is unchanged.
 2. `nelisp-gtk` `feat/phase-b0-pure-elisp-spike` branch contains:
    - `src/nelisp-gtk-ffi.el`
    - `examples/hello-window.el`

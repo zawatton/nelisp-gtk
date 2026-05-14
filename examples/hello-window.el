@@ -17,10 +17,10 @@
 ;; elisp `draw' callback that paints a red rectangle via Cairo, exit
 ;; cleanly when the user closes the window — all without compiled Rust.
 ;;
-;; Status: SCAFFOLDING.  Will not run until Phase B0.a (`nl-ffi-closure-new'
-;; in upstream nelisp) lands.  Forward calls (window creation, title,
-;; size) work today and can be exercised by commenting out the
-;; signal-connect line.
+;; Status: SCAFFOLDING.  Will not run until Phase B0.a — the
+;; `nelisp-gtk-make-closure' builtin in this repo's Rust shim — lands.
+;; Forward-only calls (window creation, title, size) work today and
+;; can be smoke-tested by commenting out the signal-connect line.
 
 ;;; Code:
 
