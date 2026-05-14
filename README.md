@@ -114,6 +114,35 @@ it.
 | 2.E   | Resize + multi-frame                                     | `(make-frame)` opens a 2nd OS window                              |
 | 2.F   | Proportional font + face merge                           | variable-width faces in buffer                                    |
 
+## Long-term goal — pure-elisp endgame
+
+The Rust binary in this repository is positioned as a **transitional
+boot-stub**, not a permanent layer.  Within the broader NeLisp
+ecosystem the explicit direction is to *reduce Rust* and grow the
+elisp / NeLisp substrate to host more work natively
+(cf. `nelisp/Final B Stage 2` which deleted the `anvil-runtime`
+Rust crate, `dev/nelisp/CLAUDE.md` "純 elisp 化が repo の存在目的").
+`nelisp-gtk` aims at the same endpoint:
+
+| Phase | Scope                                                              | Status   |
+|-------|--------------------------------------------------------------------|----------|
+| B0.a  | Add libffi closure support to NeLisp `nl-ffi-call` (= `prep_closure`, so elisp lambdas can be registered as C function pointers — prerequisite for GTK signal callbacks) | planned  |
+| B0.b  | Pure-elisp PoC: `GtkApplication` + `DrawingArea` + one `draw` signal handler, fully driven from elisp via the new closure FFI | planned (spike: ~1-2 weeks after B0.a) |
+| B     | Replace `gtk4-rs` Rust crate with NeLisp-native GTK4 FFI bindings (covers the ~50-200 GTK / Cairo / Pango / GLib functions actually used) | future   |
+| C     | Drop `src/main.rs` — pure-elisp entry point owns the GLib main loop | falls out from B |
+
+The "binary is the boot stub, elisp owns everything visible" pattern
+already in `src/main.rs` makes Phase B0–C an evolutionary path
+rather than a rewrite: each Rust file shrinks as the corresponding
+elisp side matures.  The end state is `bin/nelisp-gtk` becoming a
+thin Rust loader (or eventually a shell wrapper) that hands control
+to elisp on a NeLisp runtime, with no compiled Rust policy left.
+
+This direction is open-ended — there is no committed timeline.  It
+exists so that contributors can understand why design choices in
+the Rust side ("expose a builtin and let elisp decide") consistently
+push behaviour toward elisp.
+
 ## Using `nelisp-gtk` for non-Emacs apps
 
 This is **aspirational** at the time of writing — no non-Emacs
