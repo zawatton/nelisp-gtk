@@ -146,8 +146,11 @@ sharpen the boundary are welcome.
 
 ## License
 
-GPL-3.0-or-later (declared in `Cargo.toml`).  A `LICENSE` file will be
-added before any release tagging.
+GPL-3.0-or-later — see [`LICENSE`](LICENSE) for the full text.  This
+matches the upstream NeLisp runtime, GNU Emacs, and the broader Emacs
+Lisp ecosystem (e.g. `anvil.el`).  Vendored content under any future
+`vendor/` directory retains its original license; combined / derivative
+binary distributions are subject to the terms of GPL-3.0-or-later.
 
 ## Related repositories
 
