@@ -1,12 +1,12 @@
 [package]
-name = "nelisp-emacs-gtk"
+name = "nelisp-gtk"
 version = "0.1.0"
 edition = "2021"
 license = "GPL-3.0-or-later"
-description = "GTK4 GUI display backend for nelisp-emacs (Layer 3, Doc 51 Phase 11.C target)"
+description = "GTK4 substrate for NeLisp / elisp (Emacs frontend is the primary current use case)"
 
 [[bin]]
-name = "nemacs-gtk"
+name = "nelisp-gtk"
 path = "src/main.rs"
 
 [dependencies]

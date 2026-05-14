@@ -1,4 +1,9 @@
-# nelisp-emacs-gtk — Linux GTK4 GUI display backend
+# nelisp-gtk — GTK4 substrate for NeLisp / elisp
+
+(formerly `nelisp-emacs-gtk` — repository was renamed 2026-05-14 to reflect
+the broader scope.  The Emacs frontend on top of `nelisp-emacs` is the
+primary current use case, but the `nelisp-gtk-*` Rust→elisp builtins are
+intentionally generic so non-Emacs nelisp/elisp apps can grow on top.)
 
 ## Position in the layered architecture
 
@@ -6,7 +11,7 @@
 - **Layer 2**: nelisp-emacs substrate elisp (= upstream, repo `nelisp-emacs`)
   — `emacs-frame.el`, `emacs-redisplay.el`, `emacs-tui-event.el`, `emacs-command-loop.el`, …
 - **Layer 3**: GUI display backend (= **THIS REPO**, target Phase 11.C in Doc 43)
-  — provides `nemacs-gtk` standalone binary, plugs into the
+  — provides the `nelisp-gtk` standalone binary, plugs into the
   `nelisp-display-*` interface that `emacs-frame.el` already exposes.
 
 The TUI backend at Layer 3 is in `nelisp-emacs/src/emacs-tui-backend.el`
@@ -30,7 +35,7 @@ sudo apt install libgtk-4-dev libpango1.0-dev libcairo2-dev
 |-------|-------|-----------|
 | 1.A   | GTK4 scaffolding + hello window | `cargo run` opens window with placeholder Pango text |
 | 1.B   | Pango monospace char grid       | 24x80 grid renders fixed test string at correct cell positions |
-| 1.C   | NeLisp embed + Layer 2 elisp load | bin/nemacs-gtk evals nemacs-loadup, paints welcome buffer |
+| 1.C   | NeLisp embed + Layer 2 elisp load | `bin/nelisp-gtk` evals nemacs-loadup, paints welcome buffer |
 | 1.D   | Keyboard event integration      | self-insert / motion / Backspace working via emacs-command-loop |
 | 1.E   | `(window-system)` + `display-graphic-p` returning correct values | GUI-vs-TUI dispatch works in init.el |
 | 2.A   | Native menu bar (GMenuModel)    | File / Edit menus visible |
@@ -43,8 +48,8 @@ sudo apt install libgtk-4-dev libpango1.0-dev libcairo2-dev
 ## Repo conventions
 
 - **Cargo.lock is committed** (binary crate, reproducible builds).
-- Build: `cargo build --release` → `target/release/nemacs-gtk`.
-- Run: `cargo run` (debug) or `./target/release/nemacs-gtk` (release).
+- Build: `cargo build --release` → `target/release/nelisp-gtk`.
+- Run: `cargo run` (debug) or `./target/release/nelisp-gtk` (release).
 - Layer 2 elisp is currently NOT vendored (Phase 1.A scope = Rust only).
   Phase 1.C will vendor or path-reference `nelisp-emacs/src/`.
 

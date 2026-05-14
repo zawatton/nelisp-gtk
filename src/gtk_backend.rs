@@ -9,7 +9,7 @@
 //
 // The exposed builtin surface is intentionally minimal — GTK plumbing
 // only.  Every layout / mode-line / dispatch decision lives in
-// `nemacs-gtk-frontend.el' on the substrate side.
+// `nelisp-gtk-frontend.el' on the substrate side.
 
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
@@ -469,7 +469,7 @@ pub fn register_all(env: &mut Env, state: Rc<RefCell<GtkState>>) {
 
     // ----- nelisp-gtk-paint-frame-simple ROWS COLS BUFFER-AREA-END SCROLL CONTENT POINT MODE-LINE ECHO-AREA -----
     // Phase 3.F — fast-path single-window repaint that bundles all
-    // the work `nemacs-gtk--repaint' previously did across ~50
+    // the work `nelisp-gtk--repaint' previously did across ~50
     // separate elisp→Rust extern calls into one trip.  Writes the
     // grid + cursor in one borrow_mut, then queues a single redraw.
     //
@@ -1991,7 +1991,7 @@ fn build_window(
 
     let window = ApplicationWindow::builder()
         .application(app)
-        .title("nemacs-gtk")
+        .title("nelisp-gtk")
         // Phase 2.I: window is now resizable; the DrawingArea's
         // `resize' signal forwards new (rows, cols) to elisp via
         // `resize_queue' so the grid follows the user's drag.

@@ -7,7 +7,7 @@
 //   - `layer2_setup_form()`   : the boot elisp that loads the substrate
 //
 // All elisp policy (= mode-line composition, key dispatch, draw refresh)
-// lives in `nemacs-gtk-frontend.el' on the substrate side; this file
+// lives in `nelisp-gtk-frontend.el' on the substrate side; this file
 // only carries the boot form so the binary can `(require ...)` the
 // frontend.
 
@@ -150,7 +150,7 @@ mod tests {
         // Reproduces the EXACT main.rs boot path: layer 2 → display
         // flip → register builtins → require frontend.  Pinning this
         // catches the user-reported "Cannot open load file
-        // nemacs-gtk-frontend" + any future regression where a step
+        // nelisp-gtk-frontend" + any future regression where a step
         // disrupts load-path.
         let mut s = Session::new();
         let setup = s.eval_to_string(&layer2_setup_form());
@@ -171,7 +171,7 @@ mod tests {
         );
         eprintln!("layer2_src_path = {}", layer2_src_path());
         eprintln!("load-path car = {}", s.eval_to_string("(car load-path)"));
-        let r = s.eval_to_string("(require 'nemacs-gtk-frontend)");
+        let r = s.eval_to_string("(require 'nelisp-gtk-frontend)");
         eprintln!("require result = {r}");
         assert!(
             !r.starts_with("ERR "),
