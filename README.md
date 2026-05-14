@@ -126,8 +126,8 @@ Rust crate, `dev/nelisp/CLAUDE.md` "純 elisp 化が repo の存在目的").
 
 | Phase | Scope                                                              | Status   |
 |-------|--------------------------------------------------------------------|----------|
-| B0.a  | Add libffi closure support to NeLisp `nl-ffi-call` (= `prep_closure`, so elisp lambdas can be registered as C function pointers — prerequisite for GTK signal callbacks) | planned  |
-| B0.b  | Pure-elisp PoC: `GtkApplication` + `DrawingArea` + one `draw` signal handler, fully driven from elisp via the new closure FFI | planned (spike: ~1-2 weeks after B0.a) |
+| B0.a  | Add `nelisp-gtk-make-closure` / `-free-closure` builtins to **this repo's** Rust shim via libffi `Closure` — elisp lambdas become C function pointers (= prerequisite for GTK signal callbacks).  Implemented here, not in upstream nelisp, because nelisp's repo commitment is *to shrink* Rust, not grow it. | planned  |
+| B0.b  | Pure-elisp PoC: `GtkApplication` + `DrawingArea` + one `draw` signal handler, fully driven from elisp via the new closure builtins | planned (spike: ~1-2 weeks after B0.a) |
 | B     | Replace `gtk4-rs` Rust crate with NeLisp-native GTK4 FFI bindings (covers the ~50-200 GTK / Cairo / Pango / GLib functions actually used) | future   |
 | C     | Drop `src/main.rs` — pure-elisp entry point owns the GLib main loop | falls out from B |
 
